@@ -360,7 +360,7 @@ FILE_PATH = os.path.join(SHARED_DIR, "risk_df.pkl")
 
 if os.path.exists(FILE_PATH):
     try:
-        saved_df = pd.read_pickle(FILE_PATH)
+        saved_df = pd.read_pickle(FILE_PATH) 
         st.metric("저장된 상황보고 건수", f"{len(saved_df)} 건")
         
         st.markdown("**데이터 미리보기 (상위 5건):**")
