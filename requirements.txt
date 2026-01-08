@@ -19,3 +19,7 @@ markdownify
 olefile
 
 ollama
+
+docx2txt
+PyPDF2
+openpyxl
