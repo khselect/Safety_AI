@@ -246,32 +246,110 @@ with st.sidebar:
 st.header("📊 현재 시스템 상태")
 
 # [1] 규정 데이터 상태 (전체 너비 사용)
-st.subheader("📚 규정 데이터 (Chroma DB)")
+st.subheader("📚 규정 데이터 관리 (Chroma DB)")
 
 if os.path.exists(PERSIST_DIRECTORY):
     try:
+        # ChromaDB 로드
         vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=get_embeddings())
-        collection = vectorstore.get()
-        doc_count = len(collection['ids']) if collection else 0
+        collection = vectorstore.get() # 저장된 모든 데이터 가져오기
         
-        st.metric("학습된 규정 청크 수", f"{doc_count} 개")
+        total_docs = len(collection['ids']) if collection else 0
         
-        if doc_count > 0:
-            sources = list(set([m['source'] for m in collection['metadatas'] if m.get('source')]))
-            st.markdown("**학습된 파일 목록:**")
-            st.dataframe(pd.DataFrame(sources, columns=["파일명"]), use_container_width=True)
+        if total_docs > 0:
+            # ---------------------------------------------------------
+            # 1. 파일별 통계 데이터 가공 (파일명, 청크수, 미리보기 등)
+            # ---------------------------------------------------------
+            file_stats = {}
             
-            # (선택사항) 데이터 샘플 확인이 필요하면 주석 해제
-            # with st.expander("🔍 데이터 샘플 확인 (최근 5개)"):
-            #     for i in range(min(5, doc_count)):
-            #         st.info(f"**[{collection['metadatas'][i].get('source')}]**\n\n{collection['documents'][i][:200]}...")
-                    
+            # 메타데이터와 문서를 순회하며 그룹화
+            for idx, meta in enumerate(collection['metadatas']):
+                src = meta.get('source', '알수없음')
+                doc_content = collection['documents'][idx]
+                doc_id = collection['ids'][idx]
+                
+                if src not in file_stats:
+                    file_stats[src] = {
+                        "ids": [],          # 삭제 시 필요한 ID 리스트
+                        "count": 0,         # 청크 개수
+                        "preview": doc_content[:50].replace("\n", " ") + "..." # 내용 미리보기 (첫 청크 기준)
+                    }
+                
+                file_stats[src]["ids"].append(doc_id)
+                file_stats[src]["count"] += 1
+
+            # 데이터프레임 변환
+            df_data = []
+            for src, info in file_stats.items():
+                df_data.append({
+                    "파일명": src,
+                    "청크(Chunk) 수": info["count"],
+                    "내용 미리보기 (Article)": info["preview"]
+                })
+            
+            df_files = pd.DataFrame(df_data)
+
+            # ---------------------------------------------------------
+            # 2. 상태 표시 및 테이블 출력
+            # ---------------------------------------------------------
+            c1, c2 = st.columns([1, 1])
+            c1.metric("총 학습된 파일", f"{len(df_files)} 개")
+            c2.metric("총 벡터 청크 수", f"{total_docs} 개")
+            
+            st.markdown("##### 📋 학습된 파일 목록 상세")
+            st.dataframe(
+                df_files, 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "청크(Chunk) 수": st.column_config.NumberColumn(format="%d 개"),
+                    "내용 미리보기 (Article)": st.column_config.TextColumn(width="large")
+                }
+            )
+
+            # ---------------------------------------------------------
+            # 3. 파일 삭제 기능 (Multiselect + Button)
+            # ---------------------------------------------------------
+            st.divider()
+            st.markdown("##### 🗑️ 파일 삭제 관리")
+            
+            # 삭제할 파일 선택
+            files_to_delete = st.multiselect(
+                "삭제할 파일을 선택하세요 (복수 선택 가능):",
+                options=df_files["파일명"].tolist()
+            )
+            
+            if files_to_delete:
+                st.warning(f"선택한 {len(files_to_delete)}개 파일을 DB에서 영구 삭제하시겠습니까?")
+                if st.button("🗑️ 선택 항목 영구 삭제", type="primary"):
+                    try:
+                        # 삭제 로직
+                        total_deleted_ids = []
+                        for file_name in files_to_delete:
+                            ids = file_stats[file_name]["ids"]
+                            total_deleted_ids.extend(ids)
+                        
+                        if total_deleted_ids:
+                            vectorstore.delete(ids=total_deleted_ids)
+                            # vectorstore.persist() # 최신 Chroma 버전은 자동 저장되지만 안전을 위해 확인 필요
+                            
+                            st.success(f"✅ 총 {len(total_deleted_ids)}개의 청크(파일 {len(files_to_delete)}개)가 삭제되었습니다.")
+                            time.sleep(1.5) # 메시지 보여줄 시간 확보
+                            st.rerun() # 화면 새로고침
+                            
+                    except Exception as e:
+                        st.error(f"삭제 중 오류 발생: {e}")
+
+        else:
+            st.info("학습된 규정 데이터가 없습니다. (데이터 0건)")
+
     except Exception as e:
-        st.error(f"DB 로드 중 오류: {e}")
+        st.error(f"DB 로드 중 오류 발생: {e}")
+        st.caption("DB 파일이 손상되었거나 경로가 잘못되었을 수 있습니다.")
 else:
     st.info("학습된 규정 데이터가 없습니다. 사이드바에서 파일을 업로드하세요.")
 
-st.divider() # 섹션 구분선
+st.divider()
 
 # [2] 상황보고 데이터 상태 (전체 너비 사용)
 st.subheader("📈 상황보고 데이터 (Excel)")
