@@ -14,10 +14,13 @@
 
 • 데이터 보안 절대 보장: 국가 주요 시설인 철도의 도면, 내부 규정, 사고 내역이 외부로 유출될 원천적인 가능성을 차단합니다.
 • 운영 비용 절감: API 호출 당 비용이 발생하는 클라우드 방식과 달리, 초기 구축 후 추가적인 토큰 비용이 발생하지 않습니다. (전기세 제외 0원)
+
 [소스트리]
 <img width="624" height="474" alt="image" src="https://github.com/user-attachments/assets/49006ad0-f403-4baf-9847-99668669245f" />
+
 [관리자 페이지]
 <img width="1090" height="852" alt="image" src="https://github.com/user-attachments/assets/6cf9b1ba-2bda-46d2-9c5f-89248ffed224" />
+
 [사용자 페이지]
 <img width="1083" height="831" alt="image" src="https://github.com/user-attachments/assets/94d531a1-2754-438c-a187-60724041ea1f" />
 <img width="1068" height="818" alt="image" src="https://github.com/user-attachments/assets/b99280fc-8050-4ebc-92ad-dbf4bca50a50" />
