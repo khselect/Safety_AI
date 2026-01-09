@@ -16,6 +16,7 @@
 • 운영 비용 절감: API 호출 당 비용이 발생하는 클라우드 방식과 달리, 초기 구축 후 추가적인 토큰 비용이 발생하지 않습니다. (전기세 제외 0원)
 
 [소스트리]
+
 <img width="624" height="474" alt="image" src="https://github.com/user-attachments/assets/49006ad0-f403-4baf-9847-99668669245f" />
 
 [관리자 페이지]
