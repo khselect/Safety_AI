@@ -1,4 +1,5 @@
 온프레미스 보안 아키텍처 (On-Premise Security Architecture)
+
 ✅ 기능 정의
 외부 클라우드(OpenAI, Google 등)로 민감한 철도 데이터를 전송하지 않고, 로컬 환경(Localhost) 내에서 모든 AI 연산과 데이터 저장을 수행하는 보안 중심 아키텍처입니다.
 ⚙️ 기술적 메커니즘
