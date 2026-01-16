@@ -1,30 +1,39 @@
-import os
-import re
-import pandas as pd
 import streamlit as st
-import altair as alt  
+import os
+import pandas as pd
+import time
+import re
+import csv
+from datetime import datetime
+import altair as alt
+import json
 
-# ------------------------------------------------------------------
-# 라이브러리 및 설정
-# ------------------------------------------------------------------
+# LangChain & Core
 from langchain_chroma import Chroma
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+from langchain.schema import HumanMessage # [개선2] HumanMessage 추가
+from langchain_core.prompts import PromptTemplate
 
-# core 모듈 설정
-from core.config import PERSIST_DIRECTORY
-from core.llm import get_llm, get_embeddings
-from core.decision_ai import decision_ai
+# Core 모듈
+try:
+    from core.config import PERSIST_DIRECTORY
+    from core.llm import get_llm, get_embeddings
+    from core.decision_ai import decision_ai
+except ImportError:
+    PERSIST_DIRECTORY = "./chroma_db"
+    from core.llm import get_llm, get_embeddings
 
 # ------------------------------------------------------------------
-# 기본 페이지 설정
+# [개선] 경로 설정 (절대 경로로 고정)
 # ------------------------------------------------------------------
-st.set_page_config(
-    page_title="사용자 콘솔",
-    layout="wide"
-)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SHARED_DIR = os.path.join(BASE_DIR, "shared")
+if not os.path.exists(SHARED_DIR):
+    os.makedirs(SHARED_DIR)
+# [설정 파일 경로 정의]
+CONFIG_FILE = os.path.join(SHARED_DIR, "system_config.json")
 
-st.title("🛡️ 철도안전 AI 통합 분석 시스템")
+st.set_page_config(page_title="철도안전 AI 시스템", layout="wide")
+st.title("🚄 철도안전 AI 통합 분석 시스템 (v1.0)")
 
 # ------------------------------------------------------------------
 # 함수 정의
@@ -46,6 +55,40 @@ def get_vectorstore():
     except Exception as e:
         st.error(f"벡터 저장소 로드 중 오류 발생: {e}")
         return None
+
+# [신규 함수] 설정된 모델명 가져오기
+def get_selected_model():
+    default_model = "korean-llama3:latest"
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+                return config.get("selected_model", default_model)
+        except:
+            return default_model
+    return default_model
+
+def save_feedback(user_q, ai_a, user_correction, rating):
+    """사용자 피드백을 CSV에 저장 (관리자 학습용)"""
+    feedback_file = os.path.join(SHARED_DIR, "feedback_log.csv")
+    
+    # 파일이 없으면 헤더 생성
+    if not os.path.exists(feedback_file):
+        with open(feedback_file, mode="w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Question", "AI_Answer", "User_Correction", "Rating", "Status"])
+
+    # 데이터 추가
+    with open(feedback_file, mode="a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            user_q,
+            ai_a,
+            user_correction,
+            rating,
+            "Pending"  # 관리자가 아직 반영 안 함
+        ])
 
 def query_regulation(query, vectorstore, llm):
     """
@@ -92,7 +135,7 @@ def query_regulation(query, vectorstore, llm):
     
     result = chain.invoke({"query": query})
     return result["result"], result["source_documents"]
-
+                                
 # ------------------------------------------------------------------
 # 세션 상태 초기화
 # ------------------------------------------------------------------
@@ -141,192 +184,229 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "🚨 위험 판단 & 조치 추천"
 ])
 
-# ======================================
-# TAB 1. 💬 규정 챗봇 (멀티턴 + 고급 검색 적용)
-# ======================================
+# ==================================================================
+# TAB 1. 💬 규정 챗봇 (멀티턴 + 고급검색 + 피드백 루프)
+# ==================================================================
 with tab1:
-    st.subheader("💬 규정 전문 챗봇")
-    st.caption("💡 팁: '이전 질문에 이어서...'라고 물어보시면 문맥을 이해합니다.")
-    
-    # [1] 상단 고정 입력창
-    with st.form(key="chat_form", clear_on_submit=True):
-        col1, col2 = st.columns([8, 1])
-        with col1:
-            user_input = st.text_input(
-                "질문 입력", 
-                placeholder="예: 위험도평가 절차는 어떻게 돼?", 
-                label_visibility="collapsed"
-            )
-        with col2:
-            submit_btn = st.form_submit_button("질문하기", use_container_width=True)
+    current_model = get_selected_model()
+    st.markdown(f"#### 💬 철도안전 규정 전문 챗봇 (Model: :orange[{current_model}])")
+    st.caption("💡 규정 검색부터 업무 질의까지, AI가 문맥을 이해하고 답변합니다.")
+    # [1] 세션 상태 초기화
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    # [2] 질문 처리 로직
-    if submit_btn and user_input:
+    # [2] 이전 대화 기록 출력 (채팅방 스타일)
+    # for msg in st.session_state.messages:
+    #     with st.chat_message(msg["role"]):
+    #         st.markdown(msg["content"])
+            
+    #         if msg["role"] == "assistant":
+    #             if msg.get("sources"):
+    #                 with st.expander("📚 근거 규정 및 출처 확인"):
+    #                     for src in msg["sources"]:
+    #                         st.markdown(f"**📄 {src['source']}**")
+    #                         safe_content = src['content'].replace("|", " ").replace("\n", " ")[:200]
+    #                         st.caption(f"{safe_content}...")
+    #             if msg.get("status"):
+    #                 st.caption(msg["status"])
+
+    # [3] 새로운 사용자 입력 처리
+    if prompt := st.chat_input("규정에 대해 궁금한 점을 물어보세요..."):
+        
+        # 3-1. 사용자 메시지 즉시 표시 및 저장
+        st.chat_message("user").markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        # 3-2. 규정 DB 로드 확인
+        vectorstore = get_vectorstore()
+        
         if vectorstore is None:
-            st.error("⚠️ 규정 데이터베이스가 로드되지 않았습니다.")
+            st.error("🚨 학습된 규정 DB가 없습니다. 관리자 페이지에서 문서를 먼저 학습시켜주세요.")
         else:
-            with st.spinner("규정 정밀 분석 및 답변 생성 중..."):
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                status_placeholder = st.empty()
                 
-                # --- [ADD 0] 대화 히스토리 포맷팅 (멀티턴 핵심) ---
-                # 최근 6개(질문3+답변3) 대화만 가져와서 프롬프트에 넣음 (토큰 절약)
-                history_text = ""
-                if "messages" in st.session_state and st.session_state.messages:
-                    recent_msgs = st.session_state.messages[-6:] 
-                    history_text = "[이전 대화 내역]\n"
-                    for msg in recent_msgs:
-                        role_label = "User" if msg["role"] == "user" else "Assistant"
-                        # 이전 답변의 긴 내용은 요약하거나 전체를 넣되, 소스 정보는 제외하고 텍스트만 전달
-                        content_preview = msg["content"]
-                        history_text += f"- {role_label}: {content_preview}\n"
-                    history_text += "\n"
-
-                # --- 1. 스마트 필터링 로직 (기존 유지) ---
-                search_kwargs = {"k": 6} 
-                status_msg = "🔍 전체 규정 문서에서 검색했습니다."
-                
-                try:
-                    all_data = vectorstore.get() 
-                    unique_sources = list(set([m['source'] for m in all_data['metadatas'] if m]))
-                except:
-                    unique_sources = []
-
-                target_source_name = None
-                for source in unique_sources:
-                    base_name = os.path.basename(source)
-                    clean_name = os.path.splitext(base_name)[0]
-                    keywords = re.split(r'[_\s\.\-\(\)\[\]]+', clean_name)
-                    
-                    for kw in keywords:
-                        if len(kw) >= 2 and kw in user_input:
-                            search_kwargs["filter"] = {"source": source}
-                            target_source_name = base_name
-                            break
-                    if target_source_name: break
-
-                if target_source_name:
-                    status_msg = f"🎯 **'{target_source_name}'** 문서 내에서 집중 검색했습니다."
-                
-                # --- 2. 검색 수행 (MMR 방식 - 기존 유지) ---
-                retriever = vectorstore.as_retriever(
-                    search_type="mmr", 
-                    search_kwargs={**search_kwargs, "fetch_k": 20, "lambda_mult": 0.7} 
-                )
-                
-                retrieved_docs = retriever.invoke(user_input)
-                
-                # --- 3. 문서 정제 (기존 유지) ---
-                final_docs = []
-                seen_content = set()
-                for d in retrieved_docs:
-                    if d.page_content not in seen_content:
-                        if "|||" in d.page_content or len(d.page_content.strip()) < 10:
-                            continue
-                        final_docs.append(d)
-                        seen_content.add(d.page_content)
-                
-                context_text = "\n\n".join([d.page_content for d in final_docs])
-
-                # --- 4. 프롬프트 및 LLM 호출 (멀티턴 적용) ---
-                if not context_text:
-                    response_text = "죄송합니다. 관련된 규정 내용을 찾을 수 없습니다. (검색된 문서 없음)"
-                    final_docs = [] 
-                else:
-                    # [Modify] 프롬프트에 history_text 추가
-                    prompt_template = f"""
-                    [System Instruction]
-                    당신은 사내 규정 전문가입니다. 
-                    - [History]는 이전 대화의 맥락입니다.
-                    - [Context]는 현재 질문과 관련된 규정 원문입니다.
-                    
-                    **답변 작성 원칙**:
-                    1. **근거 중심**: 상상하지 말고 반드시 [Context]에 있는 내용으로만 답하세요. 
-                    2. **맥락 유지**: [History]를 참고하여 대명사('그것', '앞의 내용')가 무엇을 지칭하는지 파악하세요.
-                    3. **표/수치 유지**: 등급표, 지급율 등은 마크다운 표(Table)로 깔끔하게 정리하세요.
-                    4. **조항 명시**: 가능하다면 "제OO조에 따르면..." 형태로 출처를 밝히세요.
-                    5. **언어**: 한국어로 정중하게 답변하세요.
-
-                    {history_text}
-
-                    [Context]:
-                    {context_text}
-
-                    [Current Question]:
-                    {user_input}
-
-                    [Answer]:
-                    """
+                with st.spinner("규정 정밀 분석 및 답변 생성 중..."):
                     try:
-                        # invoke 대신, LLM 모델 종류에 따라 안전하게 호출
-                        from langchain.schema import HumanMessage
-                        if hasattr(llm, 'invoke'):
-                             response = llm.invoke([HumanMessage(content=prompt_template)])
-                             response_text = response.content
+                        # --- [Core 1] 대화 히스토리 포맷팅 ---
+                        history_text = ""
+                        recent_msgs = st.session_state.messages[-6:-1] 
+                        if recent_msgs:
+                            history_text = "[이전 대화 내역]\n"
+                            for m in recent_msgs:
+                                role_label = "User" if m["role"] == "user" else "Assistant"
+                                history_text += f"- {role_label}: {m['content']}\n"
+                        
+                        # --- [Core 2] 스마트 필터링 ---
+                        search_kwargs = {"k": 6}
+                        status_msg = "🔍 전체 규정 문서에서 검색했습니다."
+                        
+                        try:
+                            all_data = vectorstore.get()
+                            unique_sources = list(set([m['source'] for m in all_data['metadatas'] if m]))
+                            
+                            target_source = None
+                            for src in unique_sources:
+                                base_name = os.path.basename(src).split('.')[0]
+                                if len(base_name) >= 2 and base_name in prompt:
+                                    target_source = src
+                                    break
+                            
+                            if target_source:
+                                search_kwargs["filter"] = {"source": target_source}
+                                status_msg = f"🎯 **'{os.path.basename(target_source)}'** 문서 내에서 집중 검색했습니다."
+                        except:
+                            pass 
+                        
+                        # --- [Core 3] MMR 검색 수행 ---
+                        retriever = vectorstore.as_retriever(
+                            search_type="mmr",
+                            search_kwargs={**search_kwargs, "fetch_k": 20, "lambda_mult": 0.6}
+                        )
+                        docs = retriever.invoke(prompt)
+                        context_text = "\n\n".join([d.page_content for d in docs])
+                        
+                        # 소스 정보 구조화
+                        sources_for_ui = []
+                        seen_titles = set()
+                        for doc in docs:
+                            src_file = os.path.basename(doc.metadata.get("source", "파일"))
+                            raw_title = doc.metadata.get("Article_Title", "본문")
+                            match = re.match(r"(제\s*\d+\s*조(?:의\d+)?(?:\([^)]*\))?)", raw_title)
+                            clean_title = match.group(1) if match else raw_title[:30]
+                            
+                            key = (src_file, clean_title)
+                            if key not in seen_titles:
+                                sources_for_ui.append({"source": src_file, "title": clean_title, "content": doc.page_content})
+                                seen_titles.add(key)
+
+                        # --- [Core 4] LLM 답변 생성 (수정된 부분) ---
+                        if not context_text:
+                            response_text = "죄송합니다. 관련된 규정 내용을 찾을 수 없습니다."
                         else:
-                             response_text = llm.predict(prompt_template)
-                    except Exception as e:
-                        response_text = f"AI 응답 생성 중 오류 발생: {e}"
+                            tmpl = f"""
+                            [System Instruction]
+                            당신은 철도안전 규정 전문가입니다. 
+                            
+                            **답변 작성 원칙**:
+                            1. **근거 중심**: 상상하지 말고 반드시 [Context]에 있는 내용으로만 답하세요. 
+                            2. **맥락 유지**: [History]를 참고하여 대명사('그것', '앞의 내용')가 무엇을 지칭하는지 파악하세요.
+                            3. **표/수치 유지**: 등급표, 지급율 등은 마크다운 표(Table)로 깔끔하게 정리하세요.
+                            4. **조항 명시**: 가능하다면 "제OO조에 따르면..." 형태로 출처를 밝히세요.
+                            5. **계산**: 수식을 설명할 때도 한국어로 풀어서 설명하십시오. (예: "A multiplied by B" -> "A에 B를 곱하여")
+                            
+                            {history_text}
 
-                # --- 5. UI 업데이트 (기존 유지) ---
-                st.session_state.messages.append({"role": "user", "content": user_input})
-                
-                formatted_sources = []
-                seen_titles = set()
-                
-                for doc in final_docs:
-                    src_file = os.path.basename(doc.metadata.get("source", "파일"))
-                    raw_title = doc.metadata.get("Article_Title", "본문")
-                    match = re.match(r"(제\s*\d+\s*조(?:의\d+)?(?:\([^)]*\))?)", raw_title)
-                    clean_title = match.group(1) if match else raw_title[:30]
-                    
-                    key = (src_file, clean_title)
-                    if key not in seen_titles:
-                        formatted_sources.append({
-                            "source": src_file,
-                            "title": clean_title,
-                            "content": doc.page_content
+                            [Context]:
+                            {context_text}
+
+                            [Current Question]:
+                            {prompt}
+
+                            [Answer]:
+                            """
+                            
+                            # LLM 호출 및 변수 할당 (NameError 해결)
+                            model_name = get_selected_model() 
+                            llm = get_llm(model_name)
+                            
+                            if hasattr(llm, 'invoke'):
+                                resp = llm.invoke([HumanMessage(content=tmpl)])
+                                response_text = resp.content
+                            else:
+                                response_text = llm.predict(tmpl)
+
+                        # --- [UI Update] 결과 출력 ---
+                        # response_text가 위에서 반드시 할당되므로 에러가 발생하지 않습니다.
+                        message_placeholder.markdown(response_text)
+                        status_placeholder.caption(status_msg)
+                        
+                        # 근거 문서 아코디언
+                        if sources_for_ui:
+                            with st.expander("📚 근거 규정 및 출처 확인"):
+                                for src in sources_for_ui:
+                                    st.markdown(f"**📄 {src['source']} - {src['title']}**")
+                                    safe_content = src['content'].replace("|", " ").replace("\n", " ")[:200]
+                                    st.caption(f"{safe_content}...")
+
+                        # 세션에 Assistant 메시지 저장
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": response_text,
+                            "sources": sources_for_ui,
+                            "status": status_msg,
+                            "timestamp": time.time() # 피드백 ID용
                         })
-                        seen_titles.add(key)
+                        # 메시지 저장 후 화면 갱신 (피드백 버튼 활성화를 위해)
+                        st.rerun()
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response_text,
-                    "sources": formatted_sources,
-                    "status": status_msg
-                })
-                
-    # [3] 대화 내용 출력 (기존 유지)
+                    except Exception as e:
+                        st.error(f"오류 발생: {e}")
+
+    # 5. 대화 내역 출력 (역순 + 피드백 UI 포함)
     st.divider()
     
-    conversations = []
-    current_group = []
-
-    for msg in st.session_state.messages:
-        if msg["role"] == "user":
-            if current_group:
-                conversations.append(current_group)
-            current_group = [msg]
-        else:
-            current_group.append(msg)
-    if current_group:
-        conversations.append(current_group)
-
-    if conversations:
-        for group in reversed(conversations):
+    # 메시지가 있을 때만 처리
+    if st.session_state.messages:
+        # (1) 메시지를 (질문, 답변) 쌍으로 그룹화
+        # 가정: 리스트는 항상 [User, Assistant, User, Assistant...] 순서로 저장됨
+        conversations = []
+        msgs = st.session_state.messages
+        
+        # 2개씩 묶어서 리스트에 담음
+        for i in range(0, len(msgs), 2):
+            if i + 1 < len(msgs):
+                # (User Msg, Assistant Msg) 튜플로 저장
+                conversations.append((msgs[i], msgs[i+1]))
+            else:
+                # 짝이 안 맞는 마지막 메시지 (혹시 모를 예외 처리)
+                conversations.append((msgs[i], None))
+        
+        # (2) 그룹 자체를 역순으로 순회 (최신 대화 세트가 먼저 나옴)
+        for user_msg, ai_msg in reversed(conversations):
             with st.container():
-                for msg in group:
-                    with st.chat_message(msg["role"]):
-                        st.write(msg["content"])
-                        if msg["role"] == "assistant":
-                            if msg.get("status"):
-                                st.caption(msg["status"])
-                            if msg.get("sources"):
-                                with st.expander("📚 관련 근거 규정 확인"):
-                                    for i, src in enumerate(msg["sources"]):
-                                        st.markdown(f"**[{i+1}] {src['source']} - {src['title']}**")
-                                        display_content = src['content'].replace("|", " ").replace("\n", " ")[:200]
-                                        st.caption(f"{display_content}...")
-                st.divider()
+                # A. 사용자 질문 출력
+                if user_msg:
+                    with st.chat_message("user"):
+                        st.write(user_msg["content"])
+                
+                # B. AI 답변 출력
+                if ai_msg:
+                    with st.chat_message("assistant"):
+                        st.write(ai_msg["content"])
+                        
+                        # 부가 정보 (상태, 출처)
+                        if ai_msg.get("status"):
+                            st.caption(ai_msg["status"])
+                        
+                        if ai_msg.get("sources"):
+                            with st.expander("📚 근거 규정 보기"):
+                                for src in ai_msg["sources"]:
+                                    st.markdown(f"**📄 {src['source']}**")
+                                    safe_content = src['content'].replace("|", " ").replace("\n", " ")[:200]
+                                    st.caption(f"{safe_content}...")
+                        
+                        # 피드백 버튼 (답변 바로 아래 위치)
+                        ts = ai_msg.get("timestamp", int(time.time()))
+                        fb_key = f"fb_{ts}"
+                        
+                        col_f1, col_f2 = st.columns([1, 4])
+                        with col_f1:
+                            if st.button("👍 좋아요", key=f"lk_{fb_key}"):
+                                save_feedback(user_msg["content"], ai_msg["content"], "", "Good")
+                                st.toast("평가 감사합니다!")
+                        with col_f2:
+                            with st.popover("👎 수정 제안"):
+                                correction = st.text_area("올바른 내용:", key=f"tx_{fb_key}")
+                                if st.button("전송", key=f"sd_{fb_key}"):
+                                    if correction:
+                                        save_feedback(user_msg["content"], ai_msg["content"], correction, "Bad")
+                                        st.success("전송되었습니다.")
 
+            # 세트 간 구분선
+            st.divider()
+                                
 # ======================================
 # TAB 2. 📈 위험 상황 대시보드 (Professional Ver.)
 # ======================================
@@ -489,7 +569,6 @@ with tab2:
                             insight_text += f"""
                             - **2위 항목:** {top2['항목']} ({top2['비율']}%)
                             - **분석:** 1위 항목이 2위 대비 **{diff}건** 더 많이 발생했습니다.
-                            집중적인 관리가 필요합니다.
                             """
                     else:
                         insight_text = "데이터가 충분하지 않습니다."
@@ -549,330 +628,350 @@ with tab2:
     else:
         st.info("아직 상황보고 데이터가 없습니다. 관리자 페이지에서 데이터를 업로드해주세요.")
 
-# ======================================
-# TAB 3. 🛡️ 통합 위험 분석 (Integrated Risk Analysis) - Ver 1.2
-# ======================================
+# ==================================================================
+# TAB 3. 🧠 통합 위험 분석 (Risk Matrix) - [시각화 강화 & 자동 제안 Ver]
+# ==================================================================
 with tab3:
-    st.subheader("🛡️ 통합 위험도 평가 (Risk Assessment)")
+    st.subheader("🧠 통합 위험도 평가 (Risk Matrix)")
+    st.caption("발생 빈도(데이터 기반)와 심각도(사용자 설정)를 분석하여 위험 우선순위를 도출합니다.")
     
-    # -------------------------------------------------------
-    # [Data Load & Preprocessing]
-    # -------------------------------------------------------
-    if os.path.exists(FILE_PATH):
-        df_risk = pd.read_pickle(FILE_PATH)
-        
-        # 데이터 전처리
-        col_map = {"cause": "부원인"}
-        if "부원인" not in df_risk.columns:
-            df_risk["부원인"] = df_risk["cause"] if "cause" in df_risk.columns else "정보없음"
-        
-        # 라벨 클리닝
-        df_risk["부원인"] = df_risk["부원인"].apply(lambda x: re.sub(r'\[.*?\]', '', str(x)).strip())
+    # 파일 경로 변수 확인 (전역 변수 FILE_PATH 사용 가정)
+    target_file = FILE_PATH if os.path.exists(FILE_PATH) else None
+    
+    if target_file:
+        try:
+            df_risk = pd.read_pickle(target_file)
+            
+            # ----------------------------------------------------------
+            # [1] 데이터 전처리
+            # ----------------------------------------------------------
+            col_cause = "주원인" if "주원인" in df_risk.columns else "cause"
+            if col_cause not in df_risk.columns:
+                df_risk[col_cause] = "정보없음"
+            
+            unique_causes = df_risk[col_cause].unique()
+            
+            # ----------------------------------------------------------
+            # [2] 심각도 설정 (키워드 기반 자동 제안)
+            # ----------------------------------------------------------
+            def suggest_severity(cause_text):
+                text = str(cause_text)
+                if any(k in text for k in ['사망', '폭발', '화재', '붕괴', '충돌']): return 5 # 치명적
+                if any(k in text for k in ['추락', '협착', '끼임', '감전', '절단']): return 4 # 중대
+                if any(k in text for k in ['골절', '화상', '누출']): return 3 # 보통
+                if any(k in text for k in ['전도', '넘어짐', '부딪힘', '미끄러짐']): return 2 # 경미
+                return 1 # 무시 가능
 
-        # -------------------------------------------------------
-        # [Step 1] 심각도(Severity) 데이터 준비 (설정 UI는 하단/숨김 처리)
-        # -------------------------------------------------------
-        unique_causes = df_risk["부원인"].unique()
-
-        # 기본 심각도 매핑 함수
-        def get_default_severity(cause):
-            cause = str(cause)
-            if any(x in cause for x in ['사망', '탈선', '충돌', '화재', '폭발', '자살']): return 5
-            if any(x in cause for x in ['추락', '감전', '끼임', '협착', '절단']): return 4
-            if any(x in cause for x in ['골절', '베임', '화상', '누수']): return 3
-            if any(x in cause for x in ['넘어짐', '전도', '부딪힘', '음주', '부주의']): return 2
-            return 1
-
-        # 데이터프레임 생성
-        severity_data = []
-        for c in unique_causes:
-            severity_data.append({"사고유형": c, "심각도(1-5)": get_default_severity(c)})
-        
-        df_severity_default = pd.DataFrame(severity_data).sort_values(by="심각도(1-5)", ascending=False)
-
-        # -------------------------------------------------------
-        # [Step 1-1] 설정창: 시각적 간소화를 위해 Expander 사용
-        # -------------------------------------------------------
-        # 챗봇의 핵심(분석 결과)을 먼저 보여주기 위해 설정을 접어둠
-        with st.expander("⚙️ [설정] 사고 유형별 심각도 기준 변경하기 (클릭)", expanded=False):
-            st.caption("아래 표에서 사고 유형별 심각도(1~5)를 수정하면 매트릭스에 즉시 반영됩니다.")
-            edited_severity_df = st.data_editor(
-                df_severity_default,
-                column_config={
-                    "심각도(1-5)": st.column_config.NumberColumn(
-                        "심각도", help="1:경미 ~ 5:치명", min_value=1, max_value=5, step=1
-                    )
-                },
-                use_container_width=True,
-                hide_index=True,
-                key="severity_editor" # 키를 지정하여 상태 유지
+            with st.expander("⚙️ [설정] 사고 유형별 심각도 조정 (AI 자동 제안 적용됨)", expanded=False):
+                st.info("💡 사고 유형 키워드를 분석하여 심각도 초기값을 자동으로 제안했습니다. 실제 상황에 맞게 조정해주세요.")
+                
+                suggested_data = [{"사고유형": c, "심각도": suggest_severity(c)} for c in unique_causes]
+                df_severity_base = pd.DataFrame(suggested_data)
+                
+                edited_df = st.data_editor(
+                    df_severity_base,
+                    column_config={
+                        "심각도": st.column_config.NumberColumn(
+                            "심각도 (1-5)", 
+                            help="1(경미) ~ 5(치명적)", 
+                            min_value=1, max_value=5, step=1,
+                            format="%d점"
+                        )
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+            # ----------------------------------------------------------
+            # [3] 위험도 계산 로직
+            # ----------------------------------------------------------
+            # 1. 빈도 계산
+            df_freq = df_risk[col_cause].value_counts().reset_index()
+            df_freq.columns = ["사고유형", "발생건수"]
+            
+            # 2. 심각도 병합
+            df_calc = pd.merge(df_freq, edited_df, on="사고유형", how="left")
+            
+            # 3. 빈도 등급 계산
+            max_cnt = df_calc["발생건수"].max()
+            df_calc["빈도등급"] = df_calc["발생건수"].apply(
+                lambda x: int((x / max_cnt) * 4.99) + 1 if max_cnt > 0 else 1
             )
+            
+            # 4. 위험 점수 및 등급 판정
+            df_calc["위험점수"] = df_calc["빈도등급"] * df_calc["심각도"]
+            
+            def get_grade(score):
+                if score >= 15: return "High"
+                elif score >= 8: return "Medium"
+                return "Low"
+            df_calc["위험등급"] = df_calc["위험점수"].apply(get_grade)
+            
+            # 5. 세션 저장 (Tab 4 연동)
+            top_risks = df_calc.sort_values(["위험점수", "발생건수"], ascending=[False, False])
+            st.session_state['priority_risks'] = top_risks
 
-        # -------------------------------------------------------
-        # [Step 2] 위험도(Risk) 계산 로직
-        # -------------------------------------------------------
-        # 1. 빈도(Frequency) 집계
-        df_freq = df_risk["부원인"].value_counts().reset_index()
-        df_freq.columns = ["사고유형", "발생건수"]
+            st.divider()
 
-        # 2. 심각도(Severity) 병합 (편집된 데이터 사용)
-        df_calc = pd.merge(df_freq, edited_severity_df, on="사고유형", how="left")
+            # ----------------------------------------------------------
+            # [4] 시각화: 매트릭스 & 리스트
+            # ----------------------------------------------------------
+            c_left, c_right = st.columns([1.4, 1])
+            
+            with c_left:
+                st.markdown("##### 📊 5x5 Risk Matrix")
+                
+                # --- [4-1] 매트릭스 데이터 준비 ---
+                grid_data = []
+                for s in range(1, 6):
+                    for f in range(1, 6):
+                        score = s * f
+                        if score >= 15: color, label = "#FF7675", "High"
+                        elif score >= 8: color, label = "#FDCB6E", "Med"
+                        else: color, label = "#55EFC4", "Low"
+                        grid_data.append({"심각도_X": s, "빈도_Y": f, "점수": score, "Color": color, "Label": label})
+                df_grid_base = pd.DataFrame(grid_data)
+                
+                # 실제 데이터 집계
+                df_agg = df_calc.groupby(['심각도', '빈도등급']).agg(
+                    사고유형_리스트=('사고유형', lambda x: '<br>'.join(x[:10])),
+                    대표사고유형=('사고유형', 'first'),
+                    타입수=('사고유형', 'count'),
+                    총발생건수=('발생건수', 'sum')
+                ).reset_index()
+                
+                # 병합
+                df_matrix_final = pd.merge(
+                    df_grid_base, df_agg,
+                    left_on=['심각도_X', '빈도_Y'], right_on=['심각도', '빈도등급'],
+                    how='left'
+                ).fillna({'타입수': 0, '총발생건수': 0, '사고유형_리스트': '-'})
 
-        # 3. 빈도 등급(Freq Level) 자동 산출 (1~5등급)
-        max_count = df_calc["발생건수"].max()
-        def get_freq_level(cnt, max_val):
-            if max_val == 0: return 1
-            ratio = cnt / max_val
-            if ratio >= 0.8: return 5
-            elif ratio >= 0.6: return 4
-            elif ratio >= 0.4: return 3
-            elif ratio >= 0.2: return 2
-            else: return 1
+                # 라벨 컬럼 생성
+                def create_label(row):
+                    if row['타입수'] > 1:
+                        return f"{row['대표사고유형']} 외 {int(row['타입수'])-1}건"
+                    elif row['타입수'] == 1:
+                        return str(row['대표사고유형'])
+                    else:
+                        return ""
 
-        df_calc["빈도등급(1-5)"] = df_calc["발생건수"].apply(lambda x: get_freq_level(x, max_count))
-        df_calc["위험점수"] = df_calc["빈도등급(1-5)"] * df_calc["심각도(1-5)"]
+                df_matrix_final['셀_텍스트'] = df_matrix_final.apply(create_label, axis=1)
 
-        # 4. Risk Zone 판정
-        def get_risk_zone(score):
-            if score >= 15: return "🔴 High"
-            elif score >= 8: return "🟡 Medium"
-            else: return "🟢 Low"
+                # --- [4-2] Altair 차트 구성 ---
+                base = alt.Chart(df_matrix_final).encode(
+                    x=alt.X('심각도_X:O', title='심각도 (중대성) ➡️', axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y('빈도_Y:O', title='빈도 (가능성) ⬆️', sort="descending")
+                )
 
-        df_calc["위험등급"] = df_calc["위험점수"].apply(get_risk_zone)
+                # Layer 1: 배경
+                heatmap = base.mark_rect(stroke='white', strokeWidth=1).encode(
+                    color=alt.Color('Color', scale=None, legend=None),
+                    tooltip=[
+                        alt.Tooltip('Label', title='위험등급'),
+                        alt.Tooltip('점수', title='위험점수'),
+                        alt.Tooltip('총발생건수', title='총 발생 건수'),
+                        alt.Tooltip('타입수', title='포함된 사고유형 수'),
+                        alt.Tooltip('사고유형_리스트', title='사고유형 목록')
+                    ]
+                )
 
-        # Tab 4 연동을 위한 세션 저장
-        top_risks = df_calc.sort_values(by=["위험점수", "발생건수"], ascending=[False, False])
-        st.session_state['priority_risks'] = top_risks
+                # Layer 2: 점수
+                text_score = base.mark_text(align='right', baseline='top', dx=25, dy=-25, size=11, opacity=0.6).encode(
+                    text=alt.Text('점수', format='d'),
+                    color=alt.value('black')
+                )
+                
+                # Layer 3: 내용
+                text_content = base.transform_filter(
+                    alt.datum.타입수 > 0 
+                ).mark_text(baseline='middle', size=12, fontWeight='bold', dy=5).encode(
+                    text=alt.Text('셀_텍스트:N'),
+                    color=alt.value('black')
+                )
+
+                chart = alt.layer(heatmap, text_score, text_content).properties(
+                    width='container', height=400
+                ).configure_axis(labelFontSize=12, titleFontSize=14)
+                
+                st.altair_chart(chart, use_container_width=True)
+                st.caption("💡 마우스를 올리면 상세 정보를 확인할 수 있습니다.")
+
+            with c_right:
+                st.markdown("##### 🚨 위험 우선순위 (Top Risks)")
+                
+                if not top_risks.empty:
+                    worst = top_risks.iloc[0]
+                    st.error(
+                        f"**⚠️ 최우선 관리 대상**\n\n"
+                        f"### {worst['사고유형']}\n"
+                        f"- 위험점수: **{worst['위험점수']:.0f}점** ({worst['위험등급']})\n"
+                        f"- 발생: {worst['발생건수']}건 / 심각도: {worst['심각도']}등급"
+                    )
+                
+                st.divider()
+                
+                # ==========================================================
+            # [추가 기능] ℹ️ 위험성 평가 기준 및 로직 설명 (Legend)
+            # ==========================================================
+            with st.expander("ℹ️ 위험성 평가 기준 및 산정 로직 (상세 보기)", expanded=True):
+                st.caption("본 시스템은 철도안전관리체계 기술기준 및 ICAO SMS 매뉴얼을 준용한 위험도 평가 모델을 따릅니다.")
+                
+                l_col1, l_col2, l_col3 = st.columns(3)
+                
+                # 1. 심각도 (Severity) 정의
+                with l_col1:
+                    st.markdown("**1️⃣ 심각도(Severity) 산정 기준**")
+                    st.markdown(
+                        """
+                        <div style='font-size:13px; background-color:#f9f9f9; padding:10px; border-radius:5px;'>
+                        <b>키워드 기반 자동 매핑 (AI)</b><br>
+                        <span style='color:#FF4B4B'>🔴 5점 (치명):</span> 사망, 폭발, 화재, 붕괴<br>
+                        <span style='color:#FF8800'>🟠 4점 (중대):</span> 추락, 협착, 끼임, 감전<br>
+                        <span style='color:#FFBB00'>🟡 3점 (보통):</span> 골절, 화상, 누출<br>
+                        <span style='color:#00CC96'>🟢 2점 (경미):</span> 전도, 넘어짐, 부딪힘<br>
+                        <span style='color:grey'>⚪ 1점 (무시):</span> 기타 경미한 사항
+                        </div>
+                        """, unsafe_allow_html=True
+                    )
+
+                # 2. 빈도 (Frequency) 로직
+                with l_col2:
+                    st.markdown("**2️⃣ 빈도(Frequency) 계산 로직**")
+                    st.markdown(
+                        """
+                        <div style='font-size:13px; background-color:#f9f9f9; padding:10px; border-radius:5px;'>
+                        <b>상대 평가 (Relative Grading)</b><br>
+                        1.데이터 내 최다 발생 건수를 기준, 5등급 구간으로 자동 환산<br>
+                        [예: 최다 100건일 때, 80건 이상은 5등급]<br>
+                        2.경각심을 위한 보수적 평가, 등급은 소수점 올림(ceiling) 처리<br>
+                        [예: 2.5 -> 3등급 (무조건 올림)]<br>
+                        
+                        </div>
+                        """, unsafe_allow_html=True
+                    )
+
+                # 3. 위험도 (Risk) 판정
+                with l_col3:
+                    st.markdown("**3️⃣ 위험 등급(Risk Grade) 판정**")
+                    st.markdown(
+                        """
+                        <div style='font-size:13px; background-color:#f9f9f9; padding:10px; border-radius:5px;'>
+                        <b>Risk Score = 심각도 × 빈도</b><br>
+                        <br>
+                        <span style='background-color:#FFDDDD; padding:2px 5px; border-radius:3px;'>🔴 <b>High (15~25)</b></span>
+                        즉시 개선 대책 수립 필요 (Tab 4 연동)<br>
+                        <span style='background-color:#FFF8DD; padding:2px 5px; border-radius:3px;'>🟡 <b>Medium (8~14)</b></span>
+                        지속적 모니터링 및 관리 필요<br>
+                        <span style='background-color:#DDFFDD; padding:2px 5px; border-radius:3px;'>🟢 <b>Low (1~7)</b></span>
+                        현 상태 유지 및 관찰
+                        </div>
+                        """, unsafe_allow_html=True
+                    )
+
+                st.markdown("**상위 위험 리스트**")
+                display_df = top_risks[['사고유형', '위험등급', '위험점수', '발생건수']].head(5)
+                st.dataframe(
+                    display_df, hide_index=True, use_container_width=True,
+                    column_config={
+                        "위험등급": st.column_config.TextColumn("등급"),
+                        "위험점수": st.column_config.ProgressColumn("위험 점수", format="%d점", min_value=0, max_value=25),
+                    }
+                )
+                st.info("👉 **Tab 4**에서 AI 조치 매뉴얼을 확인하세요.")
+                    
+        except Exception as e:
+            st.error(f"분석 중 오류 발생: {e}")
+
+    else:
+        st.warning("분석할 데이터 파일이 없습니다.")
+
+
+# ==================================================================
+# TAB 4. 🚨 위험 판단 & 조치 추천 (Action Plan) - [레이아웃 개선 Ver]
+# ==================================================================
+with tab4:
+    st.subheader("🚨 위험 대응 솔루션 (Action Plan)")
+    st.caption("위험 요인에 대한 구체적인 조치 방안을 전체 화면으로 생성합니다.")
+
+    if 'priority_risks' in st.session_state and not st.session_state['priority_risks'].empty:
+        priority_df = st.session_state['priority_risks']
+        risk_list = priority_df['사고유형'].tolist()
+        
+        # 1. 상단 컨트롤 패널
+        with st.container():
+            c1, c2, c3 = st.columns([2, 2, 1])
+            
+            with c1:
+                selected_risk = st.selectbox("📌 분석할 위험 요인 선택", risk_list)
+            
+            # 선택된 위험 요인 정보
+            target_row = priority_df[priority_df['사고유형'] == selected_risk].iloc[0]
+            
+            with c2:
+                st.metric(
+                    label="위험도 정보", 
+                    value=f"{target_row['위험등급']} ({target_row['위험점수']}점)",
+                    delta=f"발생 {target_row['발생건수']}건",
+                    delta_color="inverse"
+                )
+            
+            with c3:
+                st.write("") # 줄바꿈
+                btn_generate = st.button("🧬 조치방안 생성", type="primary", use_container_width=True)
 
         st.divider()
 
-        # -------------------------------------------------------
-        # [Step 3] 5x5 Risk Matrix 시각화 (개선된 버전)
-        # -------------------------------------------------------
-        c_left, c_right = st.columns([1.6, 1])
-
-        with c_left:
-            st.markdown("##### 📊 위험성 평가 매트릭스 (Risk Matrix)")
-            
-            # 1. 그리드 데이터 생성
-            grid_data = []
-            for s in range(1, 6): 
-                for f in range(1, 6):
-                    score = s * f
-                    if score >= 15: 
-                        risk_grade, color, text_color = "High", "#FF4B4B", "white"
-                    elif score >= 8: 
-                        risk_grade, color, text_color = "Medium", "#FFAA00", "black"
-                    else: 
-                        risk_grade, color, text_color = "Low", "#00CC96", "black"
-                    
-                    grid_data.append({
-                        "심각도_X": s, "빈도등급_Y": f,
-                        "위험점수": score,
-                        "라벨": f"{risk_grade}\n{score}", # 줄바꿈 적용
-                        "배경색": color,
-                        "글자색": text_color
-                    })
-            df_grid_base = pd.DataFrame(grid_data)
-
-            # 2. 데이터 집계
-            df_agg = df_calc.groupby(["심각도(1-5)", "빈도등급(1-5)"]).agg(
-                총건수=("발생건수", "sum"),
-                사고유형_리스트=("사고유형", lambda x: ", ".join(x.unique()))
-            ).reset_index()
-            
-            # 3. 병합
-            df_matrix_final = pd.merge(
-                df_grid_base, df_agg, 
-                left_on=["심각도_X", "빈도등급_Y"], 
-                right_on=["심각도(1-5)", "빈도등급(1-5)"], 
-                how="left"
-            ).fillna({"총건수": 0, "사고유형_리스트": "-"})
-
-            # 4. Altair 차트 (폰트 크기 및 배치 수정)
-            base = alt.Chart(df_matrix_final).encode(
-                x=alt.X("심각도_X:O", title="중대성 (Severity) ➡️", axis=alt.Axis(labelAngle=0)),
-                y=alt.Y("빈도등급_Y:O", title="가능성 (Frequency) ⬆️", sort="descending")
-            ).properties(height=450) # 높이 확보
-
-            # Layer 1: 배경 히트맵
-            heatmap = base.mark_rect().encode(
-                color=alt.Color("배경색:N", scale=None),
-                tooltip=["심각도_X", "빈도등급_Y", "라벨", "총건수", "사고유형_리스트"]
-            )
-
-            # Layer 2: 위험 점수/등급 텍스트 (폰트 크게!)
-            text_score = base.mark_text(baseline="middle").encode(
-                text=alt.Text("라벨"),
-                color=alt.Color("글자색:N", scale=None),
-                size=alt.value(15),  # [수정] 폰트 크기 대폭 확대 (24px)
-                opacity=alt.value(0.6) # 배경 글씨처럼 은은하게
-            )
-
-            # Layer 3: 실제 발생 건수 (강조)
-            text_count = base.transform_filter(
-                alt.datum.총건수 > 0
-            ).mark_text(dy=25, fontWeight="bold").encode( # dy: 위치를 아래로
-                text=alt.Text("총건수", format="d"), # 숫자만 표시
-                color=alt.value("blue"),
-                size=alt.value(16)   # [수정] 건수 폰트 크기 확대 (16px)
-            )
-
-            final_chart = (heatmap + text_score + text_count).configure_axis(
-                labelFontSize=12,
-                titleFontSize=14
-            )
-            
-            st.altair_chart(final_chart, use_container_width=True)
-
-        with c_right:
-            st.markdown("##### 🚨 위험 우선순위 (Top Risks)")
-            
-            # 최우선 위험 항목 카드뷰
-            if not top_risks.empty:
-                worst = top_risks.iloc[0]
-                st.error(f"**1위: {worst['사고유형']}**")
-                
-                col_kpi1, col_kpi2 = st.columns(2)
-                col_kpi1.metric("위험 점수", f"{worst['위험점수']}점", help="심각도 x 빈도")
-                col_kpi2.metric("발생 건수", f"{worst['발생건수']}건")
-                
-                st.progress(min(worst['위험점수']/25.0, 1.0), text="위험도 수준")
-
-            st.write("") # 여백
-            
-            # 리스트 뷰
-            st.dataframe(
-                top_risks[["사고유형", "위험등급", "위험점수", "발생건수"]],
-                hide_index=True,
-                use_container_width=True,
-                height=300
-            )
-
-        # AI Insight
-        st.info("💡 **AI 분석:** 붉은색(High) 영역에 위치한 사고 유형은 '즉시 개선'이 필요한 항목입니다. 우측 리스트 상위 항목을 중심으로 안전 대책을 수립하세요.")
-
-    else:
-        st.warning("데이터 파일이 없습니다.")
-
-# ======================================
-# TAB 4. 🤖 위험 판단 및 조치 (AI Action Plan) - Ver 1.2 (Debug Mode)
-# ======================================
-from langchain.schema import HumanMessage, SystemMessage
-
-with tab4:
-    st.subheader("🤖 AI 위험 대응 솔루션")
-    st.caption("위험성 평가 결과(Tab 3)를 기반으로 사규 데이터(Tab 1)를 검색하여 맞춤형 조치를 제안합니다.")
-
-    # 1. Tab 3 분석 결과 불러오기
-    if 'priority_risks' in st.session_state and not st.session_state['priority_risks'].empty:
-        priority_df = st.session_state['priority_risks']
-        risk_options = priority_df['사고유형'].tolist()
-
-        c1, c2 = st.columns([1, 2])
-        
-        with c1:
-            st.markdown("##### 🔍 분석 대상 선택")
-            selected_risk = st.selectbox("조치 방안을 확인할 위험 요인:", risk_options)
-            
-            # 선택된 항목 정보
-            target_row = priority_df[priority_df['사고유형'] == selected_risk].iloc[0]
-            st.info(f"""
-            **{selected_risk}**
-            - 등급: {target_row['위험등급']}
-            - 점수: {target_row['위험점수']} (건수: {target_row['발생건수']})
-            """)
-            
-            generate_btn = st.button("🧬 조치방안 생성 (Real-time)", type="primary", use_container_width=True)
-
-        with c2:
-            st.markdown(f"##### 📋 '{selected_risk}' 안전 조치 가이드")
-            
-            if generate_btn:
-                # [필수 체크] 벡터 DB와 LLM 로드 여부 확인
-                if 'vectorstore' not in st.session_state:
-                    st.error("⚠️ 벡터 DB가 없습니다. Tab 1에서 문서를 먼저 임베딩해주세요.")
-                # elif 'llm' not in st.session_state: # (혹시 llm을 세션에 넣으셨다면 체크)
-                #     st.error("⚠️ LLM 모델이 로드되지 않았습니다.")
-                else:
-                    with st.spinner(f"규정 DB 검색 및 분석 중..."):
-                        try:
-                            # ---------------------------------------------------
-                            # [1] 검색 쿼리 최적화 (단순 키워드 -> 문장형)
-                            # ---------------------------------------------------
-                            # 키워드가 너무 짧으면 검색이 잘 안되므로 꼬리말을 붙여줍니다.
-                            search_query = f"{selected_risk} 사고 예방 작업 절차 안전 수칙 금지 사항"
-                            
-                            # ---------------------------------------------------
-                            # [2] 벡터 DB 검색 (Retriever)
-                            # ---------------------------------------------------
-                            # k=4: 가장 유사한 문서 조각 4개를 가져옴
-                            retriever = st.session_state['vectorstore'].as_retriever(search_kwargs={"k": 4})
-                            docs = retriever.get_relevant_documents(search_query)
-                            
-                            # 검색된 문서 내용 합치기
-                            context_text = "\n\n".join([doc.page_content for doc in docs])
-                            
-                            # ---------------------------------------------------
-                            # [3] 디버깅용: 검색된 문서가 무엇인지 확인 (중요!)
-                            # ---------------------------------------------------
-                            with st.expander("🔍 [디버깅] 벡터 DB가 찾아낸 원문 내용 보기", expanded=False):
-                                if not docs:
-                                    st.warning("관련 문서를 찾지 못했습니다. 검색어가 매뉴얼에 없을 수 있습니다.")
-                                for i, doc in enumerate(docs):
-                                    st.text(f"[문서 {i+1}] Source: {doc.metadata.get('source', 'unknown')}")
-                                    st.caption(doc.page_content[:300] + "...") # 앞부분만 미리보기
-
-                            # ---------------------------------------------------
-                            # [4] LLM 생성 요청 (실제 연동)
-                            # ---------------------------------------------------
-                            # 문맥이 너무 없으면 솔직하게 말하도록 프롬프트 조정
-                            if not context_text:
-                                st.warning("관련 규정을 찾을 수 없어 일반적인 안전 지침을 생성합니다.")
-                                context_text = "관련 사규 없음. 일반적인 산업 안전 기준을 적용할 것."
-
-                            prompt = f"""
-                            당신은 철도/산업 안전 전문가입니다. 
-                            아래의 [검색된 사규/매뉴얼]만을 근거로 하여, 
-                            위험 요인 '{selected_risk}'에 대한 구체적인 대응 매뉴얼을 작성하세요.
-
-                            [검색된 사규/매뉴얼]
-                            {context_text}
-
-                            [작성 원칙]
-                            1. 검색된 내용에 '{selected_risk}'와 직접 관련된 내용이 없다면, "관련된 내부 규정을 찾을 수 없습니다."라고 솔직히 말하고 일반적인 안전 수칙을 제안하세요.
-                            2. 뜬구름 잡는 소리 대신 '작업 전', '작업 중', '비상 시' 등 구체적인 행동 요령을 나열하세요.
-                            3. 출처(문서명 등)를 알 수 있다면 함께 명시하세요.
-                            """
-                            
-                            # 실제 LLM 호출 (main.py 상단에 선언된 llm 객체 사용)
-                            # (st.write_stream을 쓰면 타자기 효과 가능 - LangChain 버전에 따라 다름)
-                            
-                            # 방법 A: invoke 사용 (LangChain 최신)
-                            # response = llm.invoke(prompt)
-                            # result_text = response.content
-                            
-                            # 방법 B: predict 사용 (LangChain 구버전)
-                            # result_text = llm.predict(prompt)
-                            
-                            # [가정] main.py에 'llm' 객체가 있다고 가정하고 실행
-                            # 만약 llm 객체 이름이 다르면(chat_model 등) 수정 필요
-                            if 'llm' in globals():
-                                response = llm.invoke([HumanMessage(content=prompt)])
-                                result_text = response.content
-                            elif 'chat_model' in globals(): # 이름이 chat_model일 경우
-                                response = chat_model.invoke([HumanMessage(content=prompt)])
-                                result_text = response.content
-                            else:
-                                result_text = "⚠️ 코드 에러: 'llm' 또는 'chat_model' 객체가 정의되지 않았습니다. main.py를 확인해주세요."
-
-                            st.markdown(result_text)
-
-                        except Exception as e:
-                            st.error(f"생성 오류: {e}")
-                            st.info("💡 팁: Tab 1에서 벡터 DB가 정상적으로 생성되었는지 확인해보세요.")
+        # 2. 결과 출력 화면
+        if btn_generate:
+            # (주의) get_vectorstore, get_selected_model, get_llm 함수가 main.py에 정의되어 있어야 함
+            vectorstore = get_vectorstore() 
+            if not vectorstore:
+                st.error("🚨 벡터 DB가 로드되지 않았습니다. Tab 1에서 DB 상태를 확인해주세요.")
             else:
-                st.info("👈 왼쪽에서 위험 요인을 선택하고 버튼을 눌러주세요.")
-
+                with st.spinner(f"'{selected_risk}' 관련 규정 분석 및 조치안 작성 중..."):
+                    try:
+                        # RAG 검색
+                        query = f"{selected_risk} 사고 예방 작업 절차 안전 수칙"
+                        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+                        docs = retriever.invoke(query)
+                        context = "\n".join([d.page_content for d in docs])
+                        
+                        # 프롬프트 생성
+                        prompt = f"""
+                        당신은 철도 안전 전문가입니다. 
+                        아래 [검색된 규정]을 근거로 '{selected_risk}' 위험에 대한 구체적인 행동 매뉴얼을 작성하세요.
+                        
+                        [검색된 규정]
+                        {context}
+                        
+                        [작성 요령]
+                        1. 제목을 크고 명확하게 작성하세요.
+                        2. '작업 전', '작업 중', '비상 시' 단계별로 구체적으로 서술하세요.
+                        3. 규정에 없는 내용은 일반 안전 수칙을 적용하되 명시하세요.
+                        4. 불릿 포인트를 활용해 가독성을 높이세요.
+                        """
+                        
+                        model_name = get_selected_model()
+                        llm = get_llm(model_name)
+                        
+                        # LLM 호출
+                        if hasattr(llm, 'invoke'):
+                            resp = llm.invoke([HumanMessage(content=prompt)])
+                            result_text = resp.content
+                        else:
+                            result_text = llm.predict(prompt)
+                            
+                        # 결과 출력
+                        st.markdown(f"### 📋 [{selected_risk}] 안전 조치 가이드")
+                        
+                        with st.container(border=True):
+                            st.markdown(result_text)
+                        
+                        with st.expander("📎 참고한 규정 원문 보기"):
+                            st.text(context)
+                            
+                    except Exception as e:
+                        st.error(f"생성 중 오류 발생: {e}")
     else:
-        st.warning("⚠️ Tab 3(위험 분석)를 먼저 실행하여 데이터를 생성해주세요.")
+        st.warning("⚠️ Tab 3(통합 위험 분석)를 먼저 실행하여 위험 데이터를 생성해주세요.")

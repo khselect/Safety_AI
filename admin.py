@@ -7,6 +7,7 @@ import re
 import tempfile
 import sys
 import warnings
+import json
 
 # 문서 변환 라이브러리
 import pymupdf4llm
@@ -39,8 +40,15 @@ except ImportError:
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 # ------------------------------------------------------------------
-# 기본 설정
+# 기본경로 설정 (절대 경로로 고정하여 main.py와 불일치 방지)
 # ------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SHARED_DIR = os.path.join(BASE_DIR, "shared")
+if not os.path.exists(SHARED_DIR):
+    os.makedirs(SHARED_DIR)
+# [config 파일 경로 정의]
+CONFIG_FILE = os.path.join(SHARED_DIR, "system_config.json")
+
 st.set_page_config(page_title="🛠 관리자 콘솔", layout="wide")
 st.title("🛠 규정 · 리스크 관리 관리자 콘솔")
 
@@ -56,18 +64,17 @@ def clean_markdown_text(text):
         return ""
 
     # 1. 무의미한 표 행 제거 (예: | | | | | )
-    # 파이프(|), 공백(\s), 하이픈(-)으로만 구성된 줄을 삭제
     text = re.sub(r'^[|\s-]+$', '', text, flags=re.MULTILINE)
     
     # 2. 연속된 줄바꿈 및 공백 정리
-    text = re.sub(r'\n{3,}', '\n\n', text)  # 3줄 이상 공백 -> 2줄로
-    text = re.sub(r'[ \t]+', ' ', text)     # 연속된 스페이스/탭 -> 공백 1개
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r'[ \t]+', ' ', text)
     
-    # 3. 마크다운 이미지/링크 태그 제거 (텍스트 분석에 방해됨)
+    # 3. 마크다운 이미지/링크 태그 제거
     text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
     text = re.sub(r'\[.*?\]\(.*?\)', '', text)
     
-    # 4. 특수문자 노이즈 제거 (물결표 등)
+    # 4. 특수문자 노이즈 제거
     text = text.replace("~~", "")
     
     return text.strip()
@@ -83,7 +90,7 @@ def extract_hwp_text(hwp_path):
         return f"[HWP 오류] 변환 실패: {e}"
 
 def process_file_to_docs(file, source_name):
-    """파일을 읽어 청크(Chunk) 단위의 Document 리스트로 변환"""
+    """파일을 읽어 청크(Chunk) 단위의 Document 리스트로 변환 (안전 모드)"""
     file_ext = os.path.splitext(file.name)[1].lower()
     
     # 임시 파일 생성
@@ -94,25 +101,39 @@ def process_file_to_docs(file, source_name):
     try:
         # 1. 텍스트 추출
         md_text = ""
-        if file_ext == ".pdf":
-            md_text = pymupdf4llm.to_markdown(tmp_path)
-        elif file_ext == ".docx":
-            result = mammoth.convert_to_html(tmp_path)
-            html = result.value
-            md_text = markdownify.markdownify(html, heading_style="ATX", strip=['img'])
-        elif file_ext in [".hwp", ".hwpx"]:
-            raw_text = extract_hwp_text(tmp_path) 
-            md_text = f"# {source_name} 본문\n\n{raw_text}"
-        else:
-            return []
-        
-        # 2. [중요] 텍스트 강력 정제
+        try:
+            if file_ext == ".pdf":
+                md_text = pymupdf4llm.to_markdown(tmp_path)
+            elif file_ext == ".docx":
+                result = mammoth.convert_to_html(tmp_path)
+                # result.value가 None일 경우 대비
+                html_content = result.value if result.value else ""
+                md_text = markdownify.markdownify(html_content, heading_style="ATX", strip=['img'])
+            elif file_ext in [".hwp", ".hwpx"]:
+                raw_text = extract_hwp_text(tmp_path) 
+                md_text = f"# {source_name} 본문\n\n{raw_text}"
+            else:
+                return []
+        except Exception as e:
+            # 추출 실패 시 로그 남기고 빈 문자열 처리
+            st.error(f"텍스트 추출 중 상세 오류 ({file.name}): {e}")
+            md_text = ""
+
+        # [중요] 추출된 텍스트가 None이면 빈 문자열로 강제 변환
+        if md_text is None:
+            md_text = ""
+
+        # 2. 텍스트 정제
         md_text = clean_markdown_text(md_text)
+        
+        # 내용이 너무 짧으면(빈 파일 등) 스킵
+        if len(md_text.strip()) < 10:
+            return []
         
         # 3. 헤더 처리 (제N조 -> # 제N조)
         md_text = re.sub(r'(^|\n)(제\s*\d+(?:의\d+)?\s*조)', r'\n# \2', md_text)
         
-        # 4. 청크 분할 (Chunking)
+        # 4. 청크 분할
         headers_to_split_on = [("#", "Article_Title")]
         markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
         header_splits = markdown_splitter.split_text(md_text)
@@ -124,16 +145,19 @@ def process_file_to_docs(file, source_name):
         
         final_docs = []
         for doc in header_splits:
-            if len(doc.page_content.strip()) < 10:
+            # page_content가 None인지 재확인
+            content = doc.page_content
+            if not content or len(str(content).strip()) < 10:
                 continue
                 
-            splits = text_splitter.split_text(doc.page_content)
+            splits = text_splitter.split_text(str(content)) # str()로 안전하게 변환
             for split_content in splits:
                 if re.match(r'^[|\s-]+$', split_content):
                     continue
 
+                # [핵심 수정] page_content에 반드시 문자열이 들어가도록 str() 감싸기
                 new_doc = Document(
-                    page_content=split_content,
+                    page_content=str(split_content), 
                     metadata={
                         "source": source_name,
                         "Article_Title": doc.metadata.get("Article_Title", "일반"),
@@ -152,6 +176,52 @@ def process_file_to_docs(file, source_name):
 # 2. 사이드바 UI (파일 업로드 및 관리)
 # ------------------------------------------------------------------
 with st.sidebar:
+    st.header("⚙️ 시스템 설정")
+    
+    # [개선1] Ollama 모델 선택 기능
+    st.subheader("🤖 LLM 모델 선택")
+    ollama_models = [
+        "korean-gemma2:latest",
+        "korean-llama3:latest",
+        "my-korean-llama3:latest",
+        "gemma2:latest",
+        "llama3:latest",
+        "gemma3:4b",
+        "nomic-embed-text:latest" 
+    ]
+    # 1. 현재 저장된 설정 불러오기 (초기값 설정)
+    current_index = 1 # 기본값 (korean-llama3)
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved_config = json.load(f)
+                saved_model = saved_config.get("selected_model", "korean-llama3:latest")
+                if saved_model in ollama_models:
+                    current_index = ollama_models.index(saved_model)
+        except:
+            pass # 파일 읽기 실패 시 기본값 유지
+
+    # 2. 선택박스 표시
+    selected_model = st.selectbox(
+        "사용할 모델을 선택하세요:",
+        options=ollama_models,
+        index=current_index
+    )
+    
+    # 3. 변경 감지 및 파일 저장
+    # 이전 선택과 다르면 파일에 씁니다.
+    if "selected_model" not in st.session_state:
+        st.session_state.selected_model = ollama_models[current_index]
+
+    if st.session_state.selected_model != selected_model:
+        st.session_state.selected_model = selected_model
+        
+        # [핵심] JSON 파일로 저장하여 main.py와 공유
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"selected_model": selected_model}, f)
+            
+        st.toast(f"✅ 모델이 변경되었습니다: {selected_model}")
+    st.divider()
     st.header("📂 데이터 관리")
     
     # --- [섹션 1] 규정 파일 학습 ---
@@ -204,7 +274,7 @@ with st.sidebar:
 
     st.divider()
 
-    # --- [섹션 3] 상황보고 엑셀 업로드 (복구된 부분) ---
+    # --- [섹션 3] 상황보고 엑셀 업로드 ---
     st.subheader("3. 상황보고 데이터 업로드")
     excel = st.file_uploader(
         "상황보고 엑셀 업로드 (.xls, .xlsx)",
@@ -212,12 +282,10 @@ with st.sidebar:
     )
 
     if excel is not None:
-        # 파일 포인터 초기화
         excel.seek(0)
         try:
             filename = excel.name.lower()
             if filename.endswith(".xls"):
-                # .xls 지원을 위해 xlrd 라이브러리 필요 (pip install xlrd)
                 df = pd.read_excel(excel, engine="xlrd")
             elif filename.endswith(".xlsx"):
                 df = pd.read_excel(excel, engine="openpyxl")
@@ -227,12 +295,8 @@ with st.sidebar:
 
             st.success(f"엑셀 데이터 로드 완료 ({len(df)}행)")
             
-            # shared 폴더에 피클 파일로 저장 (Main 앱과 공유)
-            BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-            SHARED_DIR = os.path.join(BASE_DIR, "shared")
-            os.makedirs(SHARED_DIR, exist_ok=True)
+            # shared 폴더에 저장
             FILE_PATH = os.path.join(SHARED_DIR, "risk_df.pkl")
-
             df.to_pickle(FILE_PATH)
             st.success("✅ 상황보고 데이터가 공용 저장소에 저장되었습니다.")
             
@@ -241,7 +305,7 @@ with st.sidebar:
 
 
 # ------------------------------------------------------------------
-# 3. 메인 화면 (상태 모니터링)
+# 3. 메인 화면 (상태 모니터링 및 피드백)
 # ------------------------------------------------------------------
 st.header("📊 현재 시스템 상태")
 
@@ -250,19 +314,13 @@ st.subheader("📚 규정 데이터 관리 (Chroma DB)")
 
 if os.path.exists(PERSIST_DIRECTORY):
     try:
-        # ChromaDB 로드
         vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=get_embeddings())
-        collection = vectorstore.get() # 저장된 모든 데이터 가져오기
+        collection = vectorstore.get() 
         
         total_docs = len(collection['ids']) if collection else 0
         
         if total_docs > 0:
-            # ---------------------------------------------------------
-            # 1. 파일별 통계 데이터 가공 (파일명, 청크수, 미리보기 등)
-            # ---------------------------------------------------------
             file_stats = {}
-            
-            # 메타데이터와 문서를 순회하며 그룹화
             for idx, meta in enumerate(collection['metadatas']):
                 src = meta.get('source', '알수없음')
                 doc_content = collection['documents'][idx]
@@ -270,15 +328,13 @@ if os.path.exists(PERSIST_DIRECTORY):
                 
                 if src not in file_stats:
                     file_stats[src] = {
-                        "ids": [],          # 삭제 시 필요한 ID 리스트
-                        "count": 0,         # 청크 개수
-                        "preview": doc_content[:50].replace("\n", " ") + "..." # 내용 미리보기 (첫 청크 기준)
+                        "ids": [], 
+                        "count": 0, 
+                        "preview": doc_content[:50].replace("\n", " ") + "..."
                     }
-                
                 file_stats[src]["ids"].append(doc_id)
                 file_stats[src]["count"] += 1
 
-            # 데이터프레임 변환
             df_data = []
             for src, info in file_stats.items():
                 df_data.append({
@@ -289,9 +345,6 @@ if os.path.exists(PERSIST_DIRECTORY):
             
             df_files = pd.DataFrame(df_data)
 
-            # ---------------------------------------------------------
-            # 2. 상태 표시 및 테이블 출력
-            # ---------------------------------------------------------
             c1, c2 = st.columns([1, 1])
             c1.metric("총 학습된 파일", f"{len(df_files)} 개")
             c2.metric("총 벡터 청크 수", f"{total_docs} 개")
@@ -307,13 +360,7 @@ if os.path.exists(PERSIST_DIRECTORY):
                 }
             )
 
-            # ---------------------------------------------------------
-            # 3. 파일 삭제 기능 (Multiselect + Button)
-            # ---------------------------------------------------------
-            st.divider()
             st.markdown("##### 🗑️ 파일 삭제 관리")
-            
-            # 삭제할 파일 선택
             files_to_delete = st.multiselect(
                 "삭제할 파일을 선택하세요 (복수 선택 가능):",
                 options=df_files["파일명"].tolist()
@@ -323,7 +370,6 @@ if os.path.exists(PERSIST_DIRECTORY):
                 st.warning(f"선택한 {len(files_to_delete)}개 파일을 DB에서 영구 삭제하시겠습니까?")
                 if st.button("🗑️ 선택 항목 영구 삭제", type="primary"):
                     try:
-                        # 삭제 로직
                         total_deleted_ids = []
                         for file_name in files_to_delete:
                             ids = file_stats[file_name]["ids"]
@@ -331,12 +377,9 @@ if os.path.exists(PERSIST_DIRECTORY):
                         
                         if total_deleted_ids:
                             vectorstore.delete(ids=total_deleted_ids)
-                            # vectorstore.persist() # 최신 Chroma 버전은 자동 저장되지만 안전을 위해 확인 필요
-                            
-                            st.success(f"✅ 총 {len(total_deleted_ids)}개의 청크(파일 {len(files_to_delete)}개)가 삭제되었습니다.")
-                            time.sleep(1.5) # 메시지 보여줄 시간 확보
-                            st.rerun() # 화면 새로고침
-                            
+                            st.success(f"✅ 총 {len(total_deleted_ids)}개의 청크가 삭제되었습니다.")
+                            time.sleep(1.5)
+                            st.rerun()
                     except Exception as e:
                         st.error(f"삭제 중 오류 발생: {e}")
 
@@ -351,16 +394,14 @@ else:
 
 st.divider()
 
-# [2] 상황보고 데이터 상태 (전체 너비 사용)
+# [2] 상황보고 데이터 상태
 st.subheader("📈 상황보고 데이터 (Excel)")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SHARED_DIR = os.path.join(BASE_DIR, "shared")
-FILE_PATH = os.path.join(SHARED_DIR, "risk_df.pkl")
+RISK_FILE_PATH = os.path.join(SHARED_DIR, "risk_df.pkl")
 
-if os.path.exists(FILE_PATH):
+if os.path.exists(RISK_FILE_PATH):
     try:
-        saved_df = pd.read_pickle(FILE_PATH) 
+        saved_df = pd.read_pickle(RISK_FILE_PATH) 
         st.metric("저장된 상황보고 건수", f"{len(saved_df)} 건")
         
         st.markdown("**데이터 미리보기 (상위 5건):**")
@@ -369,3 +410,133 @@ if os.path.exists(FILE_PATH):
         st.error(f"데이터 로드 실패: {e}")
 else:
     st.info("업로드된 상황보고 엑셀 데이터가 없습니다. 사이드바에서 엑셀을 업로드하세요.")
+
+st.divider()
+
+# ==================================================================
+# admin.py 수정 코드
+# [3] 피드백 루프 (Human-in-the-Loop) 부분 전체 교체
+# ==================================================================
+
+st.divider()
+
+st.subheader("🎓 사용자 피드백 관리 (Human-in-the-Loop)")
+st.caption("사용자의 피드백을 검토하여 AI를 강화학습 시키고, 과거 학습 이력을 확인합니다.")
+
+# 절대 경로 사용
+feedback_file = os.path.join(SHARED_DIR, "feedback_log.csv")
+
+if os.path.exists(feedback_file):
+    try:
+        # 데이터 로드
+        df_fb = pd.read_csv(feedback_file)
+        
+        # 탭 분리: [검토 대기] vs [학습 완료 이력]
+        tab_review, tab_history = st.tabs(["🔥 검토 및 학습 (Pending)", "📜 학습 완료 로그 (History)"])
+        
+        # ----------------------------------------------------------
+        # TAB 1: 검토 및 학습 (기존 기능)
+        # ----------------------------------------------------------
+        with tab_review:
+            # Pending 상태만 필터링
+            pending_df = df_fb[df_fb['Status'] == 'Pending']
+            
+            if pending_df.empty:
+                st.info("🎉 현재 대기 중인 피드백이 없습니다. (모두 처리됨)")
+            else:
+                st.write(f"총 **{len(pending_df)}건**의 새로운 피드백이 대기 중입니다.")
+                
+                for index, row in pending_df.iterrows():
+                    with st.expander(f"[{row['Rating']}] {str(row['Question'])[:40]}...", expanded=True):
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.info(f"🤖 **AI 기존 답변:**\n\n{row['AI_Answer']}")
+                        with c2:
+                            st.error(f"👤 **사용자 수정 제안:**\n\n{row['User_Correction']}")
+                        
+                        btn_col1, btn_col2 = st.columns([1, 5])
+                        with btn_col1:
+                            # 학습 버튼
+                            if st.button(f"🚀 DB 학습 반영", key=f"train_{index}"):
+                                try:
+                                    # 1. QA 학습 데이터 생성
+                                    new_knowledge = f"""
+                                    [전문가 피드백 데이터]
+                                    질문: {row['Question']}
+                                    올바른 정답: {row['User_Correction']}
+                                    
+                                    (이 내용은 현장 전문가의 검증을 거쳐 수정된 지식입니다.)
+                                    """
+                                    
+                                    # 2. Document 객체 생성
+                                    doc = Document(
+                                        page_content=new_knowledge,
+                                        metadata={
+                                            "source": "Expert_Feedback", 
+                                            "category": "correction",
+                                            "original_question": row['Question'],
+                                            "applied_date": datetime.now().strftime("%Y-%m-%d")
+                                        }
+                                    )
+                                    
+                                    # 3. DB에 추가
+                                    vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=get_embeddings())
+                                    vectorstore.add_documents([doc])
+                                    
+                                    # 4. CSV 상태 업데이트 ('Applied'로 변경)
+                                    df_fb.at[index, 'Status'] = 'Applied'
+                                    # (선택) 처리 일시 기록 컬럼이 없다면 지금은 생략하거나 추가 가능
+                                    
+                                    df_fb.to_csv(feedback_file, index=False)
+                                    
+                                    st.success("✅ DB에 지식이 주입되었습니다! (이력 탭으로 이동됨)")
+                                    time.sleep(1.5)
+                                    st.rerun()
+                                    
+                                except Exception as e:
+                                    st.error(f"학습 처리 중 오류: {e}")
+                        
+                        with btn_col2:
+                            # 기각(삭제) 버튼
+                            if st.button("🗑️ 무시(삭제)", key=f"del_{index}"):
+                                df_fb.at[index, 'Status'] = 'Ignored'
+                                df_fb.to_csv(feedback_file, index=False)
+                                st.rerun()
+
+        # ----------------------------------------------------------
+        # TAB 2: 학습 완료 로그 (신규 기능)
+        # ----------------------------------------------------------
+        with tab_history:
+            # Applied 상태만 필터링 (최신순 정렬)
+            history_df = df_fb[df_fb['Status'] == 'Applied'].sort_values(by='Timestamp', ascending=False)
+            
+            if history_df.empty:
+                st.info("아직 학습에 반영된 이력이 없습니다.")
+            else:
+                st.success(f"총 **{len(history_df)}건**의 지식이 AI에 추가 학습되었습니다.")
+                
+                # 가독성을 위해 데이터프레임 표시 (필요한 컬럼만)
+                display_cols = ['Timestamp', 'Question', 'User_Correction', 'Rating']
+                
+                # 컬럼명 한글화 (보기 좋게)
+                display_df = history_df[display_cols].copy()
+                display_df.columns = ['처리일시(접수)', '질문 내용', '학습시킨 정답', '평가']
+                
+                st.dataframe(
+                    display_df, 
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # 상세 보기 (아코디언 형태)
+                with st.expander("🔍 상세 이력 조회 (클릭)"):
+                    for i, row in history_df.iterrows():
+                        st.markdown(f"**[{row['Timestamp']}] {row['Question']}**")
+                        st.text(f"👉 학습된 정답: {row['User_Correction']}")
+                        st.divider()
+
+    except Exception as e:
+        st.error(f"피드백 데이터 처리 중 오류 발생: {e}")
+
+else:
+    st.info("아직 수집된 피드백 데이터가 없습니다. (shared/feedback_log.csv 파일 없음)")
