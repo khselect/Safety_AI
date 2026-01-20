@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import shutil
 import time
+import datetime
 import pandas as pd
 import re
 import tempfile
@@ -90,24 +91,25 @@ def extract_hwp_text(hwp_path):
         return f"[HWP 오류] 변환 실패: {e}"
 
 def process_file_to_docs(file, source_name):
-    """파일을 읽어 청크(Chunk) 단위의 Document 리스트로 변환 (안전 모드)"""
+    """파일을 읽어 청크(Chunk) 단위의 Document 리스트로 변환 (완전 방어 모드)"""
     file_ext = os.path.splitext(file.name)[1].lower()
     
-    # 임시 파일 생성
+    # [수정 1] 변수를 함수 시작 지점에서 미리 선언하여 UnboundLocalError 방지
+    md_text = "" 
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
         tmp.write(file.getvalue())
         tmp_path = tmp.name
 
     try:
-        # 1. 텍스트 추출
-        md_text = ""
+        # 1. 텍스트 추출 시도
         try:
             if file_ext == ".pdf":
                 md_text = pymupdf4llm.to_markdown(tmp_path)
             elif file_ext == ".docx":
                 result = mammoth.convert_to_html(tmp_path)
-                # result.value가 None일 경우 대비
-                html_content = result.value if result.value else ""
+                # Mammoth 결과 검증
+                html_content = result.value if (result and result.value) else ""
                 md_text = markdownify.markdownify(html_content, heading_style="ATX", strip=['img'])
             elif file_ext in [".hwp", ".hwpx"]:
                 raw_text = extract_hwp_text(tmp_path) 
@@ -115,52 +117,42 @@ def process_file_to_docs(file, source_name):
             else:
                 return []
         except Exception as e:
-            # 추출 실패 시 로그 남기고 빈 문자열 처리
-            st.error(f"텍스트 추출 중 상세 오류 ({file.name}): {e}")
-            md_text = ""
+            st.error(f"파일 파싱 중 오류 발생 ({file.name}): {e}")
+            md_text = "" # 오류 발생 시 빈 문자열로 초기화
 
-        # [중요] 추출된 텍스트가 None이면 빈 문자열로 강제 변환
+        # [수정 2] 추출된 내용이 None인 경우에 대한 2중 방어
         if md_text is None:
             md_text = ""
 
         # 2. 텍스트 정제
         md_text = clean_markdown_text(md_text)
         
-        # 내용이 너무 짧으면(빈 파일 등) 스킵
         if len(md_text.strip()) < 10:
             return []
         
-        # 3. 헤더 처리 (제N조 -> # 제N조)
+        # 3. 헤더 처리 및 청킹 (기존 로직 유지)
         md_text = re.sub(r'(^|\n)(제\s*\d+(?:의\d+)?\s*조)', r'\n# \2', md_text)
         
-        # 4. 청크 분할
         headers_to_split_on = [("#", "Article_Title")]
         markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
         header_splits = markdown_splitter.split_text(md_text)
         
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, 
-            chunk_overlap=200
-        )
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         
         final_docs = []
         for doc in header_splits:
-            # page_content가 None인지 재확인
-            content = doc.page_content
-            if not content or len(str(content).strip()) < 10:
+            content = str(doc.page_content) if doc.page_content else ""
+            if len(content.strip()) < 10:
                 continue
                 
-            splits = text_splitter.split_text(str(content)) # str()로 안전하게 변환
+            splits = text_splitter.split_text(content)
             for split_content in splits:
-                if re.match(r'^[|\s-]+$', split_content):
-                    continue
-
-                # [핵심 수정] page_content에 반드시 문자열이 들어가도록 str() 감싸기
+                # [수정 3] Document 생성 시 page_content가 절대 None이 되지 않도록 강제 변환
                 new_doc = Document(
                     page_content=str(split_content), 
                     metadata={
                         "source": source_name,
-                        "Article_Title": doc.metadata.get("Article_Title", "일반"),
+                        "Article_Title": str(doc.metadata.get("Article_Title", "일반")),
                         "file_type": file_ext
                     }
                 )
@@ -276,32 +268,49 @@ with st.sidebar:
 
     # --- [섹션 3] 상황보고 엑셀 업로드 ---
     st.subheader("3. 상황보고 데이터 업로드")
-    excel = st.file_uploader(
-        "상황보고 엑셀 업로드 (.xls, .xlsx)",
-        type=["xls", "xlsx"]
+    uploaded_file = st.file_uploader(
+        "파일을 드래그하여 업로드하세요.",
+        type=["csv", "xls", "xlsx"],
+        help="CSV 또는 엑셀 파일을 업로드하면 시스템에 즉시 반영됩니다."
     )
 
-    if excel is not None:
-        excel.seek(0)
+    if uploaded_file is not None:
         try:
-            filename = excel.name.lower()
-            if filename.endswith(".xls"):
-                df = pd.read_excel(excel, engine="xlrd")
-            elif filename.endswith(".xlsx"):
-                df = pd.read_excel(excel, engine="openpyxl")
-            else:
-                st.error("지원하지 않는 엑셀 형식입니다.")
-                st.stop() 
+            filename = uploaded_file.name.lower()
+            df = None
 
-            st.success(f"엑셀 데이터 로드 완료 ({len(df)}행)")
+            # 2. 파일 확장자에 따른 처리
+            if filename.endswith(".csv"):
+                # 한글 깨짐 방지를 위해 인코딩 순차 시도
+                try:
+                    df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
+                except:
+                    uploaded_file.seek(0)  # 파일 포인터 초기화
+                    df = pd.read_csv(uploaded_file, encoding="cp949")
             
-            # shared 폴더에 저장
-            FILE_PATH = os.path.join(SHARED_DIR, "risk_df.pkl")
-            df.to_pickle(FILE_PATH)
-            st.success("✅ 상황보고 데이터가 공용 저장소에 저장되었습니다.")
-            
+            elif filename.endswith(".xls"):
+                df = pd.read_excel(uploaded_file, engine="xlrd")
+                
+            elif filename.endswith(".xlsx"):
+                df = pd.read_excel(uploaded_file, engine="openpyxl")
+
+            # 3. 데이터 저장 로직
+            if df is not None:
+                # shared 폴더 내 risk_df.pkl로 저장 (메인 분석기 연동용)
+                FILE_PATH = os.path.join(SHARED_DIR, "risk_df.pkl")
+                df.to_pickle(FILE_PATH)
+                
+                st.sidebar.success(f"✅ 업로드 완료: {filename}")
+                st.sidebar.info(f"데이터 개수: {len(df)}행")
+                
+                # 업로드 후 화면 갱신 (반영 확인용)
+                if st.sidebar.button("데이터 즉시 갱신"):
+                    st.rerun()
+            else:
+                st.sidebar.error("지원하지 않는 파일 형식입니다.")
+
         except Exception as e:
-            st.error(f"엑셀 로드 실패: {e}")
+            st.sidebar.error(f"❌ 오류 발생: {e}")
 
 
 # ------------------------------------------------------------------
@@ -457,40 +466,36 @@ if os.path.exists(feedback_file):
                         btn_col1, btn_col2 = st.columns([1, 5])
                         with btn_col1:
                             # 학습 버튼
-                            if st.button(f"🚀 DB 학습 반영", key=f"train_{index}"):
+                            if st.button(f"✅ DB 학습 반영", key=f"train_{index}"):
                                 try:
-                                    # 1. QA 학습 데이터 생성
-                                    new_knowledge = f"""
-                                    [전문가 피드백 데이터]
-                                    질문: {row['Question']}
-                                    올바른 정답: {row['User_Correction']}
+                                    raw_q = row['Question'] if pd.notna(row['Question']) else ""
+                                    raw_cor = row['User_Correction'] if pd.notna(row['User_Correction']) else ""
                                     
-                                    (이 내용은 현장 전문가의 검증을 거쳐 수정된 지식입니다.)
-                                    """
+                                    # [데이터 통일] 검색 엔진이 'Article_Title'에서 정답을 찾기 쉽게 구성
+                                    unified_title = f"철도안전법 {raw_q[:15]}" 
                                     
-                                    # 2. Document 객체 생성
-                                    doc = Document(
-                                        page_content=new_knowledge,
+                                    enhanced_content = f"질문: {raw_q}\n정답: {raw_cor}\n설명: 현장 전문가 검증을 거친 철도안전법 시행규칙 준수 사항입니다."
+
+                                    new_doc = Document(
+                                        page_content=enhanced_content, 
                                         metadata={
-                                            "source": "Expert_Feedback", 
-                                            "category": "correction",
-                                            "original_question": row['Question'],
-                                            "applied_date": datetime.now().strftime("%Y-%m-%d")
+                                            "source": "Expert_Knowledge", # 출처 통일
+                                            "type": "feedback",
+                                            "reward_score": 5.0,           # 검색 가중치를 위해 높은 보상 점수 부여
+                                            "Article_Title": unified_title, # 기존 규정과 매칭되도록 제목 부여
+                                            "timestamp": str(datetime.now())
                                         }
                                     )
                                     
-                                    # 3. DB에 추가
+                                    # DB 저장
                                     vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=get_embeddings())
-                                    vectorstore.add_documents([doc])
+                                    vectorstore.add_documents([new_doc])
                                     
-                                    # 4. CSV 상태 업데이트 ('Applied'로 변경)
+                                    # CSV 업데이트 (Status: Applied)
                                     df_fb.at[index, 'Status'] = 'Applied'
-                                    # (선택) 처리 일시 기록 컬럼이 없다면 지금은 생략하거나 추가 가능
+                                    df_fb.to_csv(feedback_file, index=False, encoding='utf-8-sig')
                                     
-                                    df_fb.to_csv(feedback_file, index=False)
-                                    
-                                    st.success("✅ DB에 지식이 주입되었습니다! (이력 탭으로 이동됨)")
-                                    time.sleep(1.5)
+                                    st.success(f"✅ '{unified_title}' 지식이 강화학습 정책에 반영되었습니다.")
                                     st.rerun()
                                     
                                 except Exception as e:
@@ -501,6 +506,19 @@ if os.path.exists(feedback_file):
                             if st.button("🗑️ 무시(삭제)", key=f"del_{index}"):
                                 df_fb.at[index, 'Status'] = 'Ignored'
                                 df_fb.to_csv(feedback_file, index=False)
+                                st.rerun()
+
+                                # 🔥 RL 관점: 잘못된 답변 패턴 기록
+                                negative_doc = Document(
+                                    page_content=f"[부정 피드백]\n질문:{row['Question']}\n잘못된 응답:{row['AI_Answer']}",
+                                    metadata={
+                                        "type": "negative_feedback",
+                                        "reward_score": -1.0,
+                                        "confidence": 0.9,
+                                        "source": "관리자 기각"
+                                    }
+                                )
+                                vectorstore.add_documents([negative_doc])
                                 st.rerun()
 
         # ----------------------------------------------------------

@@ -92,49 +92,90 @@ def save_feedback(user_q, ai_a, user_correction, rating):
 
 def query_regulation(query, vectorstore, llm):
     """
-    질문에 대해 벡터 저장소에서 문서를 찾고 LLM이 답변을 생성합니다.
+    질문에 대해 벡터 저장소에서 문서를 찾고, 
+    '사용자 피드백'을 최우선으로 정렬하여 답변을 생성합니다.
     """
-    # 검색 범위 (k=6)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
-    
+    # 1. 검색 수행 (피드백 누락 방지를 위해 k값을 넉넉히 8로 설정)
+    # MMR(Maximal Marginal Relevance)을 사용하여 다양한 맥락의 문서를 가져옵니다.
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 8, "fetch_k": 20, "lambda_mult": 0.5}
+    )
     docs = retriever.invoke(query)
-    if not docs:
-        return "해당 질문과 관련된 규정 정보를 찾을 수 없습니다.", []
 
+    if not docs:
+        return "관련된 규정 정보를 찾을 수 없습니다.", []
+
+    # 2. [핵심] 사용자 피드백 우선순위 정렬
+    # metadata['type'] == 'feedback' 이거나 source가 '사용자 피드백'인 것을 최상단으로 올림
+    def get_priority(doc):
+        m = doc.metadata
+        reward = float(m.get("reward_score", 0))
+        confidence = float(m.get("confidence", 0.5))
+
+        # 시간 감쇠 (오래된 피드백은 영향 감소)
+        try:
+            ts = datetime.fromisoformat(m.get("timestamp"))
+            age_days = (datetime.now() - ts).days
+            decay = max(0.5, 1 - age_days / 365)
+        except:
+            decay = 1.0
+        
+        # 핵심 강화학습 근사식입니다
+        return reward * confidence * decay
+
+    sorted_docs = sorted(
+        [d for d in docs if d.metadata.get("reward_score", 0) >= 0],
+        key=get_priority,
+        reverse=True
+    )
+
+    # 3. 컨텍스트 구성 (출처를 명확히 하여 LLM이 판단하기 쉽게 함)
+    context_parts = []
+    for d in sorted_docs:
+        source_name = d.metadata.get('source', '알 수 없음')
+        # 파일 경로일 경우 파일명만 추출
+        source_name = os.path.basename(source_name)
+        
+        # 피드백 데이터인 경우 강조 표시
+        if get_priority(d) >= 1:
+            context_parts.append(f"[‼️ 최신 교정 정보 - 출처: {source_name}]\n{d.page_content}")
+        else:
+            context_parts.append(f"[출처: {source_name}]\n{d.page_content}")
+    
+    context_text = "\n\n".join(context_parts)
+
+    # 4. 프롬프트 정의 (피드백 최우선 원칙 강제)
     prompt_template = """
     ### [Role]
-    당신은 한국의 철도 안전 규정 전문가입니다. 
-    아래 [규정 문맥]을 바탕으로 사용자의 질문에 답변하십시오.
+    당신은 철도 안전 규정 및 실무 전문가입니다. 
+    제공된 [규정 및 피드백 문맥]만을 바탕으로 질문에 답변하십시오.
+
+    ### [Priority Rule - 매우 중요]
+    1. 문맥 중 **'[‼️ 최신 교정 정보]'**라고 표시된 내용은 사용자가 직접 교정한 정답입니다.
+    2. 일반 규정 파일의 내용과 '최신 교정 정보'의 내용이 서로 충돌하거나 다를 경우, **반드시 '최신 교정 정보'를 정답으로 채택**하십시오.
+    3. 만약 이전의 'Feedback' 파일과 현재의 '사용자 피드백' 내용이 다르다면, 가장 위에 배치된 내용을 신뢰하십시오.
 
     ### [Guidelines]
-    1. **반드시 한국어(Korean)로만 답변하십시오.** (Do not use English).
-    2. 답변은 [규정 문맥]에 있는 내용에만 기반해야 합니다.
-    3. 규정에 없는 내용을 질문하면 "규정에 관련 내용이 없습니다"라고 답하세요.
-    4. 조항 번호(예: 제3조)나 수치(예: 10m, 30%)는 정확히 인용하세요.
-    5. 답변 톤은 전문적이고 명확하며 친절하게 작성하세요.
+    - 반드시 한국어(Korean)로 답변하십시오.
+    - 답변 시 "최신 교정된 피드백에 따르면..." 또는 "현행 규정 제O조에 따르면..."과 같이 근거를 밝히십시오.
 
-    [규정 문맥]:
+    [규정 및 피드백 문맥]
     {context}
 
     질문: {question}
-    
+
     답변:
     """
-    PROMPT = PromptTemplate(
-        template=prompt_template, 
-        input_variables=["context", "question"]
-    )
-
-    chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=True
-    )
     
-    result = chain.invoke({"query": query})
-    return result["result"], result["source_documents"]
+    full_prompt = prompt_template.format(context=context_text, question=query)
+    
+    try:
+        # LLM 호출
+        response = llm.invoke([HumanMessage(content=full_prompt)])
+        return response.content, sorted_docs
+    except Exception as e:
+        return f"답변 생성 중 오류가 발생했습니다: {e}", sorted_docs
                                 
 # ------------------------------------------------------------------
 # 세션 상태 초기화
@@ -188,29 +229,16 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # TAB 1. 💬 규정 챗봇 (멀티턴 + 고급검색 + 피드백 루프)
 # ==================================================================
 with tab1:
+    
     current_model = get_selected_model()
     st.markdown(f"#### 💬 철도안전 규정 전문 챗봇 (Model: :orange[{current_model}])")
     st.caption("💡 규정 검색부터 업무 질의까지, AI가 문맥을 이해하고 답변합니다.")
+    
     # [1] 세션 상태 초기화
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # [2] 이전 대화 기록 출력 (채팅방 스타일)
-    # for msg in st.session_state.messages:
-    #     with st.chat_message(msg["role"]):
-    #         st.markdown(msg["content"])
-            
-    #         if msg["role"] == "assistant":
-    #             if msg.get("sources"):
-    #                 with st.expander("📚 근거 규정 및 출처 확인"):
-    #                     for src in msg["sources"]:
-    #                         st.markdown(f"**📄 {src['source']}**")
-    #                         safe_content = src['content'].replace("|", " ").replace("\n", " ")[:200]
-    #                         st.caption(f"{safe_content}...")
-    #             if msg.get("status"):
-    #                 st.caption(msg["status"])
-
-    # [3] 새로운 사용자 입력 처리
+    # [2] 새로운 사용자 입력 처리
     if prompt := st.chat_input("규정에 대해 궁금한 점을 물어보세요..."):
         
         # 3-1. 사용자 메시지 즉시 표시 및 저장
@@ -229,165 +257,111 @@ with tab1:
                 
                 with st.spinner("규정 정밀 분석 및 답변 생성 중..."):
                     try:
-                        # --- [Core 1] 대화 히스토리 포맷팅 ---
-                        history_text = ""
-                        recent_msgs = st.session_state.messages[-6:-1] 
-                        if recent_msgs:
-                            history_text = "[이전 대화 내역]\n"
-                            for m in recent_msgs:
-                                role_label = "User" if m["role"] == "user" else "Assistant"
-                                history_text += f"- {role_label}: {m['content']}\n"
+                        # --- [신규 추가] 1. 전문가 피드백 데이터 우선 확인 로직 ---
+                        feedback_file = os.path.join(SHARED_DIR, "feedback_log.csv")
+                        verified_answer = None
                         
-                        # --- [Core 2] 스마트 필터링 ---
-                        search_kwargs = {"k": 6}
-                        status_msg = "🔍 전체 규정 문서에서 검색했습니다."
-                        
-                        try:
-                            all_data = vectorstore.get()
-                            unique_sources = list(set([m['source'] for m in all_data['metadatas'] if m]))
+                        if os.path.exists(feedback_file):
+                            fb_df = pd.read_csv(feedback_file)
+                            # Applied(학습 완료) 상태이면서 사용자의 질문과 유사한 데이터 검색
+                            # (질문의 앞 7글자 정도가 포함되거나, 질문 전체가 포함되는 경우)
+                            match = fb_df[
+                                (fb_df['Status'] == 'Applied') & 
+                                (fb_df['Question'].apply(lambda x: x[:7] in prompt or prompt[:7] in x))
+                            ]
                             
-                            target_source = None
-                            for src in unique_sources:
-                                base_name = os.path.basename(src).split('.')[0]
-                                if len(base_name) >= 2 and base_name in prompt:
-                                    target_source = src
-                                    break
+                            if not match.empty:
+                                # 가장 최근에 승인된 정답을 가져옴
+                                verified_answer = match.iloc[-1]['User_Correction']
+
+                        # --- 2. 답변 결정 (피드백 정답 vs RAG 생성) ---
+                        if verified_answer:
+                            # 전문가가 이미 교정한 정답이 있는 경우
+                            response_text = f"✅ **[전문가 검증 답변]**\n\n{verified_answer}"
+                            docs = [] # 피드백 답변이므로 별도 검색 결과는 비움 (또는 검색 병행 가능)
+                            status_msg = "💡 관리자가 승인한 전문가 지식베이스에서 정답을 찾았습니다."
+                        else:
+                            # 검증된 정답이 없는 경우 기존 RAG 로직 실행
+                            model_name = get_selected_model() 
+                            llm_instance = get_llm(model_name)
+                            response_text, docs = query_regulation(prompt, vectorstore, llm_instance)
+                            status_msg = "🔍 피드백 우선 검색 알고리즘이 적용되었습니다. (AI 생성 답변)"
                             
-                            if target_source:
-                                search_kwargs["filter"] = {"source": target_source}
-                                status_msg = f"🎯 **'{os.path.basename(target_source)}'** 문서 내에서 집중 검색했습니다."
-                        except:
-                            pass 
-                        
-                        # --- [Core 3] MMR 검색 수행 ---
-                        retriever = vectorstore.as_retriever(
-                            search_type="mmr",
-                            search_kwargs={**search_kwargs, "fetch_k": 20, "lambda_mult": 0.6}
-                        )
-                        docs = retriever.invoke(prompt)
-                        context_text = "\n\n".join([d.page_content for d in docs])
-                        
-                        # 소스 정보 구조화
+                        # 소스 정보 구조화 (UI 출력용)
                         sources_for_ui = []
                         seen_titles = set()
                         for doc in docs:
                             src_file = os.path.basename(doc.metadata.get("source", "파일"))
-                            raw_title = doc.metadata.get("Article_Title", "본문")
-                            match = re.match(r"(제\s*\d+\s*조(?:의\d+)?(?:\([^)]*\))?)", raw_title)
-                            clean_title = match.group(1) if match else raw_title[:30]
+                            title = doc.metadata.get("Article_Title", "본문")
                             
-                            key = (src_file, clean_title)
+                            key = (src_file, title)
                             if key not in seen_titles:
-                                sources_for_ui.append({"source": src_file, "title": clean_title, "content": doc.page_content})
+                                sources_for_ui.append({
+                                    "source": src_file, 
+                                    "title": title, 
+                                    "content": doc.page_content
+                                })
                                 seen_titles.add(key)
 
-                        # --- [Core 4] LLM 답변 생성 (수정된 부분) ---
-                        if not context_text:
-                            response_text = "죄송합니다. 관련된 규정 내용을 찾을 수 없습니다."
-                        else:
-                            tmpl = f"""
-                            [System Instruction]
-                            당신은 철도안전 규정 전문가입니다. 
-                            
-                            **답변 작성 원칙**:
-                            1. **근거 중심**: 상상하지 말고 반드시 [Context]에 있는 내용으로만 답하세요. 
-                            2. **맥락 유지**: [History]를 참고하여 대명사('그것', '앞의 내용')가 무엇을 지칭하는지 파악하세요.
-                            3. **표/수치 유지**: 등급표, 지급율 등은 마크다운 표(Table)로 깔끔하게 정리하세요.
-                            4. **조항 명시**: 가능하다면 "제OO조에 따르면..." 형태로 출처를 밝히세요.
-                            5. **계산**: 수식을 설명할 때도 한국어로 풀어서 설명하십시오. (예: "A multiplied by B" -> "A에 B를 곱하여")
-                            
-                            {history_text}
-
-                            [Context]:
-                            {context_text}
-
-                            [Current Question]:
-                            {prompt}
-
-                            [Answer]:
-                            """
-                            
-                            # LLM 호출 및 변수 할당 (NameError 해결)
-                            model_name = get_selected_model() 
-                            llm = get_llm(model_name)
-                            
-                            if hasattr(llm, 'invoke'):
-                                resp = llm.invoke([HumanMessage(content=tmpl)])
-                                response_text = resp.content
-                            else:
-                                response_text = llm.predict(tmpl)
-
-                        # --- [UI Update] 결과 출력 ---
-                        # response_text가 위에서 반드시 할당되므로 에러가 발생하지 않습니다.
+                        # 결과 출력
                         message_placeholder.markdown(response_text)
-                        status_placeholder.caption(status_msg)
+                        status_placeholder.caption("🔍 피드백 우선 검색 알고리즘이 적용되었습니다.")
                         
-                        # 근거 문서 아코디언
-                        if sources_for_ui:
-                            with st.expander("📚 근거 규정 및 출처 확인"):
-                                for src in sources_for_ui:
-                                    st.markdown(f"**📄 {src['source']} - {src['title']}**")
-                                    safe_content = src['content'].replace("|", " ").replace("\n", " ")[:200]
-                                    st.caption(f"{safe_content}...")
-
                         # 세션에 Assistant 메시지 저장
                         st.session_state.messages.append({
                             "role": "assistant", 
                             "content": response_text,
                             "sources": sources_for_ui,
-                            "status": status_msg,
-                            "timestamp": time.time() # 피드백 ID용
+                            "status": "🔍 피드백 우선 검색 결과입니다.",
+                            "timestamp": time.time()
                         })
-                        # 메시지 저장 후 화면 갱신 (피드백 버튼 활성화를 위해)
+                        
+                        # 화면 갱신 (피드백 버튼 및 대화 내역 반영)
                         st.rerun()
 
                     except Exception as e:
                         st.error(f"오류 발생: {e}")
 
-    # 5. 대화 내역 출력 (역순 + 피드백 UI 포함)
+    # [3] 대화 내역 출력 (if prompt 블록 외부)
+    # 질문을 입력하지 않았을 때도 이전 대화가 보여야 하므로 인덴트를 밖으로 뺍니다.
     st.divider()
     
-    # 메시지가 있을 때만 처리
     if st.session_state.messages:
-        # (1) 메시지를 (질문, 답변) 쌍으로 그룹화
-        # 가정: 리스트는 항상 [User, Assistant, User, Assistant...] 순서로 저장됨
+        # 메시지를 (질문, 답변) 쌍으로 그룹화
         conversations = []
         msgs = st.session_state.messages
         
-        # 2개씩 묶어서 리스트에 담음
         for i in range(0, len(msgs), 2):
             if i + 1 < len(msgs):
-                # (User Msg, Assistant Msg) 튜플로 저장
                 conversations.append((msgs[i], msgs[i+1]))
             else:
-                # 짝이 안 맞는 마지막 메시지 (혹시 모를 예외 처리)
                 conversations.append((msgs[i], None))
         
-        # (2) 그룹 자체를 역순으로 순회 (최신 대화 세트가 먼저 나옴)
+        # 최신 대화가 위로 오도록 역순 출력
         for user_msg, ai_msg in reversed(conversations):
             with st.container():
-                # A. 사용자 질문 출력
+                # A. 사용자 질문
                 if user_msg:
                     with st.chat_message("user"):
                         st.write(user_msg["content"])
                 
-                # B. AI 답변 출력
+                # B. AI 답변
                 if ai_msg:
                     with st.chat_message("assistant"):
                         st.write(ai_msg["content"])
                         
-                        # 부가 정보 (상태, 출처)
                         if ai_msg.get("status"):
                             st.caption(ai_msg["status"])
                         
                         if ai_msg.get("sources"):
                             with st.expander("📚 근거 규정 보기"):
                                 for src in ai_msg["sources"]:
-                                    st.markdown(f"**📄 {src['source']}**")
-                                    safe_content = src['content'].replace("|", " ").replace("\n", " ")[:200]
+                                    st.markdown(f"**📄 {src['source']} - {src['title']}**")
+                                    # 표 형식 깨짐 방지 및 길이 제한
+                                    safe_content = src['content'].replace("|", " ").replace("\n", " ")[:250]
                                     st.caption(f"{safe_content}...")
                         
-                        # 피드백 버튼 (답변 바로 아래 위치)
+                        # 피드백 버튼 UI
                         ts = ai_msg.get("timestamp", int(time.time()))
                         fb_key = f"fb_{ts}"
                         
@@ -402,9 +376,8 @@ with tab1:
                                 if st.button("전송", key=f"sd_{fb_key}"):
                                     if correction:
                                         save_feedback(user_msg["content"], ai_msg["content"], correction, "Bad")
-                                        st.success("전송되었습니다.")
+                                        st.success("전송되었습니다. 관리자가 검토 후 DB에 반영합니다.")
 
-            # 세트 간 구분선
             st.divider()
                                 
 # ======================================
