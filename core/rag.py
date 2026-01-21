@@ -17,7 +17,8 @@ def query_regulation(query, vectorstore, llm):
             keywords = [k for k in query.split() if len(k) > 1]
             match = fb_df[
                 (fb_df['Status'] == 'Applied') & 
-                (fb_df['Question'].apply(lambda x: all(k in str(x) for k in keywords[:2])))
+                #(fb_df['Question'].apply(lambda x: all(k in str(x) for k in keywords[:2])))
+                (fb_df['Question'].str.contains(query[:5])) # 키워드 기반 매칭(v1.3)
             ]
             if not match.empty:
                 best_answer = match.iloc[-1]['User_Correction']
@@ -40,10 +41,10 @@ def query_regulation(query, vectorstore, llm):
     # 벡터(의미) 검색
     vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
     
-    # 앙상블 검색기 (키워드 0.7 : 벡터 0.3) -> '시행시기' 단어 적중률 향상
+    # 앙상블 검색기 (키워드 0.8 : 벡터 0.2) 
     ensemble_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, vector_retriever],
-        weights=[0.7, 0.3]
+        weights=[0.8, 0.2]
     )
     
     docs = ensemble_retriever.invoke(query)
@@ -56,10 +57,10 @@ def query_regulation(query, vectorstore, llm):
         context_text += f"\n{prefix}\n[{doc.metadata.get('Article_Title', '규정')}] {doc.page_content}\n"
 
     template = """당신은 철도안전법 전문가입니다. 
-    제공된 [규정 내용]을 바탕으로 질문에 답하세요. 
-    특히 질문의 핵심(예: '시행시기' 인지 '평가방법' 인지)을 조문 번호와 함께 정확히 구분하세요.
-    별표나 시행규칙 내용이 있다면 이를 우선순위에 두어 답변하세요.
-
+    1. 반드시 제공된 [규정 내용]에 명시된 내용만 답변하십시오.
+    2. 일반적인 상식이나 타 기관의 사례를 절대 언급하지 마십시오.
+    3. 답변은 반드시 "취업규칙 제NN조"와 같이 명확한 근거를 서술하며 시작하십시오.
+    4. 규정에 없는 내용을 묻는 경우 "해당 규정(취업규칙 등)에는 관련 내용이 명시되어 있지 않습니다"라고만 답하십시오.
     [규정 내용]
     {context}
 

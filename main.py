@@ -9,7 +9,10 @@ import altair as alt
 import json
 
 # LangChain & Core
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain.schema import HumanMessage # [개선2] HumanMessage 추가
 from langchain_core.prompts import PromptTemplate
 
@@ -46,7 +49,7 @@ def get_vectorstore():
     try:
         # 2. ChromaDB 로드
         # 주의: collection_name="regulations" 부분을 삭제했습니다.
-        # admin.py에서 저장한 기본 설정과 맞추기 위함입니다.
+        # admin.py에서 저장한 기본 설정과 맞추기 위함입니다
         vectorstore = Chroma(
             persist_directory=PERSIST_DIRECTORY,
             embedding_function=get_embeddings()
@@ -90,93 +93,158 @@ def save_feedback(user_q, ai_a, user_correction, rating):
             "Pending"  # 관리자가 아직 반영 안 함
         ])
 
-def query_regulation(query, vectorstore, llm):
-    """
-    질문에 대해 벡터 저장소에서 문서를 찾고, 
-    '사용자 피드백'을 최우선으로 정렬하여 답변을 생성합니다.
-    """
-    # 1. 검색 수행 (피드백 누락 방지를 위해 k값을 넉넉히 8로 설정)
-    # MMR(Maximal Marginal Relevance)을 사용하여 다양한 맥락의 문서를 가져옵니다.
-    retriever = vectorstore.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": 8, "fetch_k": 20, "lambda_mult": 0.5}
-    )
-    docs = retriever.invoke(query)
+# def query_regulation(query, vectorstore, llm):
+#     """
+#     질문에 대해 벡터 저장소에서 문서를 찾고, 
+#     '사용자 피드백'을 최우선으로 정렬하여 답변을 생성합니다.
+#     """
+#     # 1. 검색 수행 (피드백 누락 방지를 위해 k값을 넉넉히 8로 설정)
+#     # MMR(Maximal Marginal Relevance)을 사용하여 다양한 맥락의 문서를 가져옵니다.
+#     retriever = vectorstore.as_retriever(
+#         search_type="mmr",
+#         search_kwargs={"k": 8, "fetch_k": 20, "lambda_mult": 0.5}
+#     )
+#     docs = retriever.invoke(query)
 
-    if not docs:
-        return "관련된 규정 정보를 찾을 수 없습니다.", []
+#     if not docs:
+#         return "관련된 규정 정보를 찾을 수 없습니다.", []
 
-    # 2. [핵심] 사용자 피드백 우선순위 정렬
-    # metadata['type'] == 'feedback' 이거나 source가 '사용자 피드백'인 것을 최상단으로 올림
-    def get_priority(doc):
-        m = doc.metadata
-        reward = float(m.get("reward_score", 0))
-        confidence = float(m.get("confidence", 0.5))
+#     # 2. [핵심] 사용자 피드백 우선순위 정렬
+#     # metadata['type'] == 'feedback' 이거나 source가 '사용자 피드백'인 것을 최상단으로 올림
+#     def get_priority(doc):
+#         m = doc.metadata
+#         reward = float(m.get("reward_score", 0))
+#         confidence = float(m.get("confidence", 0.5))
 
-        # 시간 감쇠 (오래된 피드백은 영향 감소)
-        try:
-            ts = datetime.fromisoformat(m.get("timestamp"))
-            age_days = (datetime.now() - ts).days
-            decay = max(0.5, 1 - age_days / 365)
-        except:
-            decay = 1.0
+#         # 시간 감쇠 (오래된 피드백은 영향 감소)
+#         try:
+#             ts = datetime.fromisoformat(m.get("timestamp"))
+#             age_days = (datetime.now() - ts).days
+#             decay = max(0.5, 1 - age_days / 365)
+#         except:
+#             decay = 1.0
         
-        # 핵심 강화학습 근사식입니다
-        return reward * confidence * decay
+#         # 핵심 강화학습 근사식입니다
+#         return reward * confidence * decay
 
-    sorted_docs = sorted(
-        [d for d in docs if d.metadata.get("reward_score", 0) >= 0],
-        key=get_priority,
-        reverse=True
-    )
+#     sorted_docs = sorted(
+#         [d for d in docs if d.metadata.get("reward_score", 0) >= 0],
+#         key=get_priority,
+#         reverse=True
+#     )
 
-    # 3. 컨텍스트 구성 (출처를 명확히 하여 LLM이 판단하기 쉽게 함)
-    context_parts = []
-    for d in sorted_docs:
-        source_name = d.metadata.get('source', '알 수 없음')
-        # 파일 경로일 경우 파일명만 추출
-        source_name = os.path.basename(source_name)
+#     # 3. 컨텍스트 구성 (출처를 명확히 하여 LLM이 판단하기 쉽게 함)
+#     context_parts = []
+#     for d in sorted_docs:
+#         source_name = d.metadata.get('source', '알 수 없음')
+#         # 파일 경로일 경우 파일명만 추출
+#         source_name = os.path.basename(source_name)
         
-        # 피드백 데이터인 경우 강조 표시
-        if get_priority(d) >= 1:
-            context_parts.append(f"[‼️ 최신 교정 정보 - 출처: {source_name}]\n{d.page_content}")
-        else:
-            context_parts.append(f"[출처: {source_name}]\n{d.page_content}")
+#         # 피드백 데이터인 경우 강조 표시
+#         if get_priority(d) >= 1:
+#             context_parts.append(f"[‼️ 최신 교정 정보 - 출처: {source_name}]\n{d.page_content}")
+#         else:
+#             context_parts.append(f"[출처: {source_name}]\n{d.page_content}")
     
-    context_text = "\n\n".join(context_parts)
+#     context_text = "\n\n".join(context_parts)
 
-    # 4. 프롬프트 정의 (피드백 최우선 원칙 강제)
-    prompt_template = """
-    ### [Role]
-    당신은 철도 안전 규정 및 실무 전문가입니다. 
-    제공된 [규정 및 피드백 문맥]만을 바탕으로 질문에 답변하십시오.
+#     # 4. 프롬프트 정의 (피드백 최우선 원칙 강제)
+#     prompt_template = """
+#     ### [Role]
+#     당신은 철도 안전 규정 및 실무 전문가입니다. 
+#     제공된 [규정 및 피드백 문맥]만을 바탕으로 질문에 답변하십시오.
 
-    ### [Priority Rule - 매우 중요]
-    1. 문맥 중 **'[‼️ 최신 교정 정보]'**라고 표시된 내용은 사용자가 직접 교정한 정답입니다.
-    2. 일반 규정 파일의 내용과 '최신 교정 정보'의 내용이 서로 충돌하거나 다를 경우, **반드시 '최신 교정 정보'를 정답으로 채택**하십시오.
-    3. 만약 이전의 'Feedback' 파일과 현재의 '사용자 피드백' 내용이 다르다면, 가장 위에 배치된 내용을 신뢰하십시오.
+#     ### [Priority Rule - 매우 중요]
+#     1. 문맥 중 **'[‼️ 최신 교정 정보]'**라고 표시된 내용은 사용자가 직접 교정한 정답입니다.
+#     2. 일반 규정 파일의 내용과 '최신 교정 정보'의 내용이 서로 충돌하거나 다를 경우, **반드시 '최신 교정 정보'를 정답으로 채택**하십시오.
+#     3. 만약 이전의 'Feedback' 파일과 현재의 '사용자 피드백' 내용이 다르다면, 가장 위에 배치된 내용을 신뢰하십시오.
 
-    ### [Guidelines]
-    - 반드시 한국어(Korean)로 답변하십시오.
-    - 답변 시 "최신 교정된 피드백에 따르면..." 또는 "현행 규정 제O조에 따르면..."과 같이 근거를 밝히십시오.
+#     ### [Guidelines]
+#     - 반드시 한국어(Korean)로 답변하십시오.
+#     - 답변 시 "최신 교정된 피드백에 따르면..." 또는 "현행 규정 제O조에 따르면..."과 같이 근거를 밝히십시오.
 
-    [규정 및 피드백 문맥]
+#     [규정 및 피드백 문맥]
+#     {context}
+
+#     질문: {question}
+
+#     답변:
+#     """
+    
+#     full_prompt = prompt_template.format(context=context_text, question=query)
+    
+#     try:
+#         # LLM 호출
+#         response = llm.invoke([HumanMessage(content=full_prompt)])
+#         return response.content, sorted_docs
+#     except Exception as e:
+#         return f"답변 생성 중 오류가 발생했습니다: {e}", sorted_docs
+
+# [수정] query_regulation 함수: 키워드 정밀도 및 전문가 정책 반영
+def query_regulation(query, vectorstore, llm):
+    # 1. 전문가 피드백(Applied) 데이터 최우선 확인 (Fast-Track)
+    # 관리자가 admin.py에서 '청원휴가' 정답을 승인했다면 여기서 즉시 반환됩니다.
+    feedback_file = os.path.join(SHARED_DIR, "feedback_log.csv")
+    if os.path.exists(feedback_file):
+        try:
+            fb_df = pd.read_csv(feedback_file)
+            # 질문의 앞 5글자가 포함된 'Applied' 상태의 정답 검색
+            match = fb_df[(fb_df['Status'] == 'Applied') & (fb_df['Question'].str.contains(query[:5]))]
+            if not match.empty:
+                return f"✅ **[전문가 검증 답변]**\n\n{match.iloc[-1]['User_Correction']}", []
+        except: pass
+
+    # 2. 하이브리드 검색 엔진 구성 (BM25 + Vector)
+    # [문제해결] '청원휴가'라는 정확한 단어를 찾기 위해 BM25 가중치를 0.8로 설정
+    all_docs_data = vectorstore.get()
+    all_docs = [
+        Document(page_content=text, metadata=meta) 
+        for text, meta in zip(all_docs_data['documents'], all_docs_data['metadatas'])
+    ]
+    
+    # 키워드 검색기 (단어 일치 중심)
+    bm25_retriever = BM25Retriever.from_documents(all_docs)
+    bm25_retriever.k = 3
+    
+    # 벡터 검색기 (의미 유사도 중심)
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    
+    # 앙상블: 법령은 키워드가 중요하므로 BM25에 압도적 가중치 부여
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, vector_retriever],
+        weights=[0.8, 0.2] 
+    )
+    
+    docs = ensemble_retriever.invoke(query)
+
+    # 3. 제목 기반 재정렬 (Article_Title 우선순위 부여)
+    # 질문 키워드가 조문 제목에 포함되어 있다면 검색 결과 1위로 올림
+    query_keywords = query.split()
+    docs = sorted(docs, key=lambda d: any(kw in d.metadata.get('Article_Title', '') for kw in query_keywords), reverse=True)
+
+    # 4. 프롬프트 구성 (LLM의 환각 방지 지침 강화)
+    context_text = "\n\n".join([f"### {doc.metadata.get('Article_Title', '조문 정보 없음')}\n{doc.page_content}" for doc in docs])
+    
+    template = """당신은 우리공사 규정 전문가입니다. 
+    제공된 [규정 내용]의 '제목'과 '본문'을 대조하여 질문에 정확히 답하세요.
+
+    [규정 내용]
     {context}
 
-    질문: {question}
+    [질문]
+    {question}
 
-    답변:
+    [답변 가이드라인]
+    1. 질문이 '{question}'인 경우, 제목에 이 단어가 포함된 조문(예: 제26조 청원휴가)을 우선적으로 설명하세요.
+    2. 조문 번호를 절대 다른 조문(제9조 등)과 혼동하지 마세요.
+    3. 일반적인 노동법 상식을 섞지 말고, 오직 위에 제공된 텍스트로만 답변하세요.
     """
     
-    full_prompt = prompt_template.format(context=context_text, question=query)
+    prompt_text = template.format(context=context_text, question=query)
+    response = llm.invoke([HumanMessage(content=prompt_text)])
     
-    try:
-        # LLM 호출
-        response = llm.invoke([HumanMessage(content=full_prompt)])
-        return response.content, sorted_docs
-    except Exception as e:
-        return f"답변 생성 중 오류가 발생했습니다: {e}", sorted_docs
-                                
+    return response.content, docs
+
 # ------------------------------------------------------------------
 # 세션 상태 초기화
 # ------------------------------------------------------------------

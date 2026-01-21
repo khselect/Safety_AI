@@ -18,7 +18,9 @@ import olefile
 
 # LangChain & Chroma 관련
 from langchain_chroma import Chroma
+from langchain.retrievers import EnsembleRetriever
 from langchain_community.document_loaders import PyMuPDFLoader
+from langchain.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_core.documents import Document
 
@@ -481,9 +483,11 @@ if os.path.exists(feedback_file):
                                         metadata={
                                             "source": "Expert_Knowledge", # 출처 통일
                                             "type": "feedback",
-                                            "reward_score": 5.0,           # 검색 가중치를 위해 높은 보상 점수 부여
-                                            "Article_Title": unified_title, # 기존 규정과 매칭되도록 제목 부여
-                                            "timestamp": str(datetime.now())
+                                            # "reward_score": 5.0,           # 검색 가중치를 위해 높은 보상 점수 부여
+                                            # "Article_Title": unified_title, # 기존 규정과 매칭되도록 제목 부여
+                                            "Article_Title": f"[검증] {raw_q[:15]}", # 제목 필드 강화(v1.3)
+                                            "reward_score": 10.0, # 검색 순위 최상단 보장 점수(v1.3)
+                                            "timestamp": str(datetime.datetime.now())
                                         }
                                     )
                                     
