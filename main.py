@@ -3,6 +3,7 @@ import os
 import pandas as pd
 import time
 import re
+import pydeck as pdk
 import csv
 from datetime import datetime
 import altair as alt
@@ -155,7 +156,7 @@ def save_feedback(user_q, ai_a, user_correction, rating):
 #     제공된 [규정 및 피드백 문맥]만을 바탕으로 질문에 답변하십시오.
 
 #     ### [Priority Rule - 매우 중요]
-#     1. 문맥 중 **'[‼️ 최신 교정 정보]'**라고 표시된 내용은 사용자가 직접 교정한 정답입니다.
+#     1. 문맥 중 **'[최신 교정 정보]'**라고 표시된 내용은 사용자가 직접 교정한 정답입니다.
 #     2. 일반 규정 파일의 내용과 '최신 교정 정보'의 내용이 서로 충돌하거나 다를 경우, **반드시 '최신 교정 정보'를 정답으로 채택**하십시오.
 #     3. 만약 이전의 'Feedback' 파일과 현재의 '사용자 피드백' 내용이 다르다면, 가장 위에 배치된 내용을 신뢰하십시오.
 
@@ -237,7 +238,8 @@ def query_regulation(query, vectorstore, llm):
     [답변 가이드라인]
     1. 질문이 '{question}'인 경우, 제목에 이 단어가 포함된 조문(예: 제26조 청원휴가)을 우선적으로 설명하세요.
     2. 조문 번호를 절대 다른 조문(제9조 등)과 혼동하지 마세요.
-    3. 일반적인 노동법 상식을 섞지 말고, 오직 위에 제공된 텍스트로만 답변하세요.
+    3. 일반적인 노동법 상식을 섞지 말고, 오직 위에 제공된 임베딩 된 학습 텍스트로만 답변하세요.
+    4. 모든 질문에 대한 답변은 반드시 한국어로만 작성해줘.
     """
     
     prompt_text = template.format(context=context_text, question=query)
@@ -518,6 +520,111 @@ with tab2:
                 if filtered_df.empty: filtered_df = df 
             else:
                 filtered_df = df[df["호선_정제"] == selected_line]
+            
+            if not filtered_df.empty:
+                # -----------------------------------------------------------
+                # [3-0] 역별 사고 분포도 (Geospatial Analysis)
+                # -----------------------------------------------------------
+                st.markdown("##### 📍 역별 사고 발생 분포 및 위험도 시각화")
+
+                st.caption("호선별 노선 라인과 역별 사고 건수가 지도상에 상시 표시됩니다.")
+
+                # 1. 역명 정제 및 통계
+                map_df = filtered_df.copy()
+                map_df["역명_정제"] = map_df["발생역"].apply(lambda x: re.sub(r'\[.*?\]', '', str(x)).strip())
+                station_stats = map_df.groupby(["역명_정제", "호선_정제"]).size().reset_index(name='발생건수')
+
+                # 2. 역별 좌표 데이터 (위도, 경도)
+                STATION_COORDS = {
+                    "계양": [126.7354, 37.5714], "임학": [126.7351, 37.5450], "작전": [126.7224, 37.5308], 
+                    "부평시장": [126.7225, 37.4982], "부평": [126.7241, 37.4895], "예술회관": [126.7011, 37.4494], 
+                    "인천터미널": [126.7003, 37.4423], "원인재": [126.6875, 37.4125], "송도": [126.6661, 37.4286],
+                    "검단사거리": [126.6749, 37.6026], "서구청": [126.6749, 37.5451], "주안": [126.6797, 37.4649], 
+                    "석남": [126.6761, 37.5061], "부평구청": [126.7206, 37.5085], "굴포천": [126.7314, 37.5069], 
+                    "상동": [126.7533, 37.5059], "부천시청": [126.7640, 37.5047], "까치울": [126.8115, 37.5062]
+                }
+
+                # 3. 호선별 컬러 정의 (라인 전용)
+                LINE_COLORS = {
+                    "1호선": [160, 160, 160, 200], # 회색
+                    "2호선": [255, 127, 0, 200],   # 주황
+                    "7호선": [105, 114, 0, 200]    # 초록
+                }
+
+                # 4. 데이터 가공 및 그라데이션 계산
+                station_stats["coordinates"] = station_stats["역명_정제"].map(STATION_COORDS)
+                plot_data = station_stats.dropna(subset=["coordinates"])
+
+                # 상시 표시될 라벨 텍스트 생성
+                plot_data["label"] = plot_data.apply(lambda r: f"{r['역명_정제']}\n({r['발생건수']}건)", axis=1)
+
+                # [핵심] 빨간색 그라데이션 계산 (건수가 많을수록 진한 빨강)
+                max_cnt = plot_data["발생건수"].max() if not plot_data.empty else 1
+                # 건수에 따라 Green, Blue 값을 낮추어 Red를 강조함
+                plot_data["fill_color"] = plot_data["발생건수"].apply(
+                    lambda x: [255, int(200 * (1 - x/max_cnt)), int(200 * (1 - x/max_cnt)), 180]
+                )
+
+                # 5. 노선 Path 데이터 생성
+                path_data = []
+                LINE_PATHS = {
+                    "1호선": ["계양", "임학", "작전", "부평시장", "부평", "예술회관", "인천터미널", "원인재", "송도"],
+                    "2호선": ["검단사거리", "서구청", "석남", "주안"],
+                    "7호선": ["까치울", "부천시청", "상동", "굴포천", "부평구청", "석남"]
+                }
+                for line_name, sequence in LINE_PATHS.items():
+                    coords = [STATION_COORDS[st] for st in sequence if st in STATION_COORDS]
+                    if len(coords) > 1:
+                        path_data.append({"path": coords, "color": LINE_COLORS[line_name]})
+
+                # 6. Pydeck 레이어 구성
+                # [Layer 1] 노선 연결 라인
+                path_layer = pdk.Layer(
+                    "PathLayer",
+                    path_data,
+                    get_path="path",
+                    get_color="color",
+                    width_min_pixels=3,
+                    pickable=True
+                )
+
+                # [Layer 2] 사고 분포 원 (빨간색 그라데이션 적용)
+                scatter_layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    plot_data,
+                    get_position="coordinates",
+                    get_fill_color="fill_color",
+                    get_radius="발생건수 * 1 + 150",
+                    pickable=True,
+                    stroked=True,
+                    get_line_color=[150, 0, 0],
+                    line_width_min_pixels=1
+                )
+
+                # [Layer 3] 상시 라벨 (역명 + 건수)
+                text_layer = pdk.Layer(
+                    "TextLayer",
+                    plot_data,
+                    get_position="coordinates",
+                    get_text="label",
+                    get_size=14,
+                    get_color=[30, 30, 30],
+                    get_alignment_baseline="'bottom'",
+                    get_pixel_offset=[0, -20], # 원 크기를 고려해 오프셋 조정
+                    font_family="Malgun Gothic, sans-serif"
+                )
+
+                # 7. 지도 렌더링
+                view_state = pdk.ViewState(latitude=37.51, longitude=126.73, zoom=10.5, pitch=0)
+
+                st.pydeck_chart(pdk.Deck(
+                    layers=[path_layer, scatter_layer, text_layer],
+                    initial_view_state=view_state,
+                    map_style='https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+                    tooltip={"text": "{역명_정제}: {발생건수}건"}
+                ))
+
+                st.markdown("---")
 
             # -----------------------------------------------------------
             # [3] 대시보드 시각화

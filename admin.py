@@ -512,18 +512,18 @@ if os.path.exists(feedback_file):
                                 df_fb.to_csv(feedback_file, index=False)
                                 st.rerun()
 
-                                # 🔥 RL 관점: 잘못된 답변 패턴 기록
-                                negative_doc = Document(
-                                    page_content=f"[부정 피드백]\n질문:{row['Question']}\n잘못된 응답:{row['AI_Answer']}",
-                                    metadata={
-                                        "type": "negative_feedback",
-                                        "reward_score": -1.0,
-                                        "confidence": 0.9,
-                                        "source": "관리자 기각"
-                                    }
-                                )
-                                vectorstore.add_documents([negative_doc])
-                                st.rerun()
+                            # RL 관점: 잘못된 답변 패턴 기록
+                            negative_doc = Document(
+                                page_content=f"[부정 피드백]\n질문:{row['Question']}\n잘못된 응답:{row['AI_Answer']}",
+                                metadata={
+                                    "type": "negative_feedback",
+                                    "reward_score": -1.0,
+                                    "confidence": 0.9,
+                                    "source": "관리자 기각"
+                                }
+                            )
+                            vectorstore.add_documents([negative_doc])
+                            st.rerun()
 
         # ----------------------------------------------------------
         # TAB 2: 학습 완료 로그 (신규 기능)
