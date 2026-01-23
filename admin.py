@@ -20,7 +20,6 @@ import olefile
 from langchain_chroma import Chroma
 from langchain.retrievers import EnsembleRetriever
 from langchain_community.document_loaders import PyMuPDFLoader
-from langchain.retrievers import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_core.documents import Document
 
