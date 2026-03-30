@@ -174,13 +174,13 @@ with st.sidebar:
     # [개선1] Ollama 모델 선택 기능
     st.subheader("🤖 LLM 모델 선택")
     ollama_models = [
-        "korean-gemma2:latest",
-        "korean-llama3:latest",
-        "my-korean-llama3:latest",
-        "gemma2:latest",
-        "llama3:latest",
-        "gemma3:4b",
-        "nomic-embed-text:latest" 
+        "qwen3:8b",
+        "qwen2.5:7b-instruct",
+        # "korean-llama3:latest",
+        # "korean-gemma2:latest",
+        # "my-korean-llama3:latest",
+        # "llama3:latest",
+        "gemma3:4b"
     ]
     # 1. 현재 저장된 설정 불러오기 (초기값 설정)
     current_index = 1 # 기본값 (korean-llama3)

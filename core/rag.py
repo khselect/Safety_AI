@@ -1,76 +1,147 @@
 from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
 from langchain_core.documents import Document
+from langchain.schema import HumanMessage, SystemMessage
 import pandas as pd
+import re
 import os
 
-def query_regulation(query, vectorstore, llm):
-    # [설정] 피드백 파일 경로
-    FEEDBACK_FILE = os.path.join(SHARED_DIR, "feedback_log.csv")
+# ------------------------------------------------------------------
+# [핵심 개선 1] 한국어 전용 SystemMessage
+# - user 프롬프트의 지시보다 system 레벨 지시를 모델이 더 강하게 따름
+# - ChatOllama는 SystemMessage를 별도 system 파라미터로 처리함
+# ------------------------------------------------------------------
+KOREAN_SYSTEM_MESSAGE = SystemMessage(content=(
+    "You are a Korean railway safety regulation expert. "
+    "You MUST answer ONLY in Korean (한국어). "
+    "Never use English, Chinese, or any other language in your response. "
+    "If you start writing in any language other than Korean, stop immediately and restart in Korean."
+))
 
-    # 1. 전문가 정책(Policy) 우선 필터링 - CSV 직접 탐색
-    # 강화학습의 'Policy Update'를 가장 확실하게 반영하는 방법입니다.
-    if os.path.exists(FEEDBACK_FILE):
+# ------------------------------------------------------------------
+# [핵심 개선 2] 한국어 감지 + 자동 재번역 후처리
+# - langdetect 없이도 동작하는 간단한 한국어 비율 체크
+# ------------------------------------------------------------------
+def is_korean_response(text: str) -> bool:
+    """한글 문자 비율이 10% 미만이면 한국어 답변이 아닌 것으로 판단"""
+    if not text or len(text.strip()) == 0:
+        return False
+    korean_chars = len(re.findall(r'[\uAC00-\uD7A3]', text))
+    total_chars = len(re.sub(r'\s', '', text))  # 공백 제외
+    if total_chars == 0:
+        return False
+    ratio = korean_chars / total_chars
+    return ratio >= 0.1  # 한글 비율 10% 이상이면 한국어 답변으로 판단
+
+
+def translate_to_korean(text: str, llm) -> str:
+    """영어로 된 답변을 한국어로 재번역 요청"""
+    translate_prompt = f"""다음 텍스트를 한국어로 번역해주세요. 번역문만 출력하고 다른 설명은 하지 마세요.
+
+번역할 텍스트:
+{text}
+
+한국어 번역:"""
+    try:
+        response = llm.invoke([
+            KOREAN_SYSTEM_MESSAGE,
+            HumanMessage(content=translate_prompt)
+        ])
+        return response.content
+    except Exception:
+        return text  # 번역 실패 시 원문 반환
+
+
+# ------------------------------------------------------------------
+# [핵심 개선 3] 모델별 template prefix 분기
+# ------------------------------------------------------------------
+def get_template(model_name: str) -> str:
+    """qwen3 계열만 /no_think 적용"""
+    prefix = "/no_think\n" if "qwen3" in model_name.lower() else ""
+    return f"""{prefix}
+[규정 내용]
+{{context}}
+
+[질문]
+{{question}}
+
+[답변 가이드라인]
+1. 반드시 제공된 [규정 내용]에 명시된 내용만 답변하십시오.
+2. 질문 키워드가 포함된 조문 제목(예: 제26조 청원휴가)을 최우선으로 설명하세요.
+3. 조문 번호를 다른 조문과 절대 혼동하지 마세요.
+4. 답변은 "제NN조(조문명)에 따르면," 형식으로 근거를 명시하며 시작하세요.
+5. 규정에 없는 내용은 "해당 규정에는 관련 내용이 명시되어 있지 않습니다"라고만 답하세요.
+6. 일반적인 노동법 상식을 섞지 말고 제공된 규정 텍스트로만 답변하세요.
+반드시 한국어로만 답변하세요."""
+
+
+# ------------------------------------------------------------------
+# 메인 RAG 함수
+# ------------------------------------------------------------------
+def query_regulation(query, vectorstore, llm, model_name="", shared_dir=""):
+    SHARED_DIR = shared_dir  # main.py에서 주입받은 경로 사용
+
+    # ① 전문가 피드백(Applied) Fast-Track
+    feedback_file = os.path.join(SHARED_DIR, "feedback_log.csv")
+    if os.path.exists(feedback_file):
         try:
-            fb_df = pd.read_csv(FEEDBACK_FILE)
-            # 'Applied' 상태이며 질문의 핵심 키워드가 포함된 경우 (가장 최근 데이터 우선)
-            keywords = [k for k in query.split() if len(k) > 1]
+            fb_df = pd.read_csv(feedback_file)
             match = fb_df[
-                (fb_df['Status'] == 'Applied') & 
-                #(fb_df['Question'].apply(lambda x: all(k in str(x) for k in keywords[:2])))
-                (fb_df['Question'].str.contains(query[:5])) # 키워드 기반 매칭(v1.3)
+                (fb_df['Status'] == 'Applied') &
+                (fb_df['Question'].str.contains(query[:5], na=False))
             ]
             if not match.empty:
-                best_answer = match.iloc[-1]['User_Correction']
-                return f"✅ **[전문가 검증 답변]**\n\n{best_answer}", []
-        except:
+                return f"✅ **[전문가 검증 답변]**\n\n{match.iloc[-1]['User_Correction']}", []
+        except Exception:
             pass
 
-    # 2. 하이브리드 검색 (BM25 + Vector) - [문제 1/3 해결]
-    # 키워드 검색(BM25)은 '시행시기'와 '평가'를 명확히 구분합니다.
+    # ② 하이브리드 검색 (BM25 0.8 + Vector 0.2)
     all_docs_data = vectorstore.get()
     all_docs = [
-        Document(page_content=text, metadata=meta) 
+        Document(page_content=text, metadata=meta)
         for text, meta in zip(all_docs_data['documents'], all_docs_data['metadatas'])
     ]
-    
-    # BM25(키워드) 가중치 강화
+
     bm25_retriever = BM25Retriever.from_documents(all_docs)
     bm25_retriever.k = 3
-    
-    # 벡터(의미) 검색
+
     vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    
-    # 앙상블 검색기 (키워드 0.8 : 벡터 0.2) 
+
     ensemble_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, vector_retriever],
         weights=[0.8, 0.2]
     )
-    
+
     docs = ensemble_retriever.invoke(query)
 
-    # 3. 프롬프트 엔지니어링 (강화학습 보상 반영)
-    context_text = ""
-    for doc in docs:
-        # 전문가 피드백 데이터에 가중치(Reward) 부여 문구 추가
-        prefix = "⭐[최우선 참고: 전문가 검증 지식]" if doc.metadata.get('type') == 'feedback' else ""
-        context_text += f"\n{prefix}\n[{doc.metadata.get('Article_Title', '규정')}] {doc.page_content}\n"
+    # ③ 제목 기반 재정렬
+    query_keywords = query.split()
+    docs = sorted(
+        docs,
+        key=lambda d: any(kw in d.metadata.get('Article_Title', '') for kw in query_keywords),
+        reverse=True
+    )
 
-    template = """당신은 철도안전법 전문가입니다. 
-    1. 반드시 제공된 [규정 내용]에 명시된 내용만 답변하십시오.
-    2. 일반적인 상식이나 타 기관의 사례를 절대 언급하지 마십시오.
-    3. 답변은 반드시 "취업규칙 제NN조"와 같이 명확한 근거를 서술하며 시작하십시오.
-    4. 규정에 없는 내용을 묻는 경우 "해당 규정(취업규칙 등)에는 관련 내용이 명시되어 있지 않습니다"라고만 답하십시오.
-    5. 모든 질문에 대한 답변은 반드시 한국어로만 작성해줘.
-    5. 일반적인 노동법 상식을 섞지 말고, 오직 위에 제공된 임베딩 된 학습 텍스트로만 답변하세요.
-    [규정 내용]
-    {context}
+    # ④ 컨텍스트 구성
+    context_text = "\n\n".join([
+        f"### {doc.metadata.get('Article_Title', '조문 정보 없음')}\n{doc.page_content}"
+        for doc in docs
+    ])
 
-    [질문]
-    {question}
-    """
-    
+    # ⑤ 프롬프트 구성
+    template = get_template(model_name)
     prompt_text = template.format(context=context_text, question=query)
-    response = llm.invoke([HumanMessage(content=prompt_text)])
-    
-    return response.content, docs
+
+    # ⑥ LLM 호출 — [개선 1] SystemMessage를 별도로 분리하여 전달
+    response = llm.invoke([
+        KOREAN_SYSTEM_MESSAGE,          # system 레벨 한국어 강제
+        HumanMessage(content=prompt_text)
+    ])
+    answer = response.content
+
+    # ⑦ [개선 2] 후처리: 한국어 감지 → 영어면 자동 재번역
+    if not is_korean_response(answer):
+        print(f"[경고] 비한국어 답변 감지 → 재번역 시도 (모델: {model_name})")
+        answer = translate_to_korean(answer, llm)
+
+    return answer, docs
