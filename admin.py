@@ -18,7 +18,6 @@ import olefile
 
 # LangChain & Chroma 관련
 from langchain_chroma import Chroma
-from langchain.retrievers import EnsembleRetriever
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_core.documents import Document
@@ -180,7 +179,7 @@ with st.sidebar:
         # "korean-gemma2:latest",
         # "my-korean-llama3:latest",
         # "llama3:latest",
-        "gemma3:4b"
+        "gemma4:latest"
     ]
     # 1. 현재 저장된 설정 불러오기 (초기값 설정)
     current_index = 1 # 기본값 (korean-llama3)
