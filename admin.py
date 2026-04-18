@@ -182,12 +182,12 @@ with st.sidebar:
         "gemma4:latest"
     ]
     # 1. 현재 저장된 설정 불러오기 (초기값 설정)
-    current_index = 1 # 기본값 (korean-llama3)
+    current_index = 0 # 기본값 (qwen3:8b)
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved_config = json.load(f)
-                saved_model = saved_config.get("selected_model", "korean-llama3:latest")
+                saved_model = saved_config.get("selected_model", "qwen3:8b")
                 if saved_model in ollama_models:
                     current_index = ollama_models.index(saved_model)
         except:
