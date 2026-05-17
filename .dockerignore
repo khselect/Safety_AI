@@ -1,0 +1,11 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+.env
+.env.*
+*.xlsx
+*.csv
+chroma_db/
+shared/
+nginx-safety_ai.conf
