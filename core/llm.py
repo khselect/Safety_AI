@@ -1,3 +1,4 @@
+import os
 from langchain_community.chat_models import ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
 import streamlit as st
@@ -11,8 +12,9 @@ def get_embeddings():
     )
 
 def get_llm(model_name: str, temperature=0):
+    ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
     return ChatOllama(
         model=model_name,
-        base_url="http://127.0.0.1:11434",
+        base_url=ollama_host,
         temperature=temperature
     )

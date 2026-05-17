@@ -175,11 +175,7 @@ with st.sidebar:
     ollama_models = [
         "qwen3:8b",
         "qwen2.5:7b-instruct",
-        # "korean-llama3:latest",
-        # "korean-gemma2:latest",
-        # "my-korean-llama3:latest",
-        # "llama3:latest",
-        "gemma4:latest"
+        "llama3.1:8b",
     ]
     # 1. 현재 저장된 설정 불러오기 (초기값 설정)
     current_index = 0 # 기본값 (qwen3:8b)

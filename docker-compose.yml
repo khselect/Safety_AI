@@ -9,41 +9,9 @@ services:
       - ./chroma_db:/app/chroma_db
       - ./shared:/app/shared
     environment:
-      - OLLAMA_HOST=http://ollama:11434
-      - NO_PROXY=localhost,127.0.0.1,ollama
+      # Mac mini의 로컬 Ollama에 연결 (host.docker.internal은 Mac/Windows Docker 자동 지원)
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - NO_PROXY=localhost,127.0.0.1,host.docker.internal
       - TOKENIZERS_PARALLELISM=false
-    depends_on:
-      ollama:
-        condition: service_healthy
-    networks:
-      - safety_net
-
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    volumes:
-      - ollama_data:/root/.ollama
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/version"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    networks:
-      - safety_net
-    # GPU 사용 시 아래 주석 해제
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-
-volumes:
-  ollama_data:
-
-networks:
-  safety_net:
-    driver: bridge
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Linux 서버일 경우 필요
