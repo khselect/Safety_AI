@@ -1,10 +1,34 @@
 from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers import EnsembleRetriever
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.documents import Document
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from sentence_transformers import CrossEncoder
 import pandas as pd
 import re
 import os
+
+# ------------------------------------------------------------------
+# Cross-Encoder 싱글톤 — 첫 호출 시 1회 로드 후 재사용
+# BAAI/bge-reranker-base: 한국어 포함 다국어 지원, ~280MB
+# ------------------------------------------------------------------
+_cross_encoder: CrossEncoder | None = None
+
+def _get_cross_encoder() -> CrossEncoder:
+    global _cross_encoder
+    if _cross_encoder is None:
+        _cross_encoder = CrossEncoder("BAAI/bge-reranker-base")
+    return _cross_encoder
+
+
+def _rerank(query: str, docs: list, top_k: int = 4) -> list:
+    """CrossEncoder로 (query, doc) 쌍을 재채점하여 상위 top_k 반환"""
+    if not docs:
+        return docs
+    ce = _get_cross_encoder()
+    pairs = [(query, doc.page_content) for doc in docs]
+    scores = ce.predict(pairs)
+    ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in ranked[:top_k]]
 
 # ------------------------------------------------------------------
 # [핵심 개선 1] 한국어 전용 SystemMessage
@@ -103,9 +127,9 @@ def query_regulation(query, vectorstore, llm, model_name="", shared_dir=""):
     ]
 
     bm25_retriever = BM25Retriever.from_documents(all_docs)
-    bm25_retriever.k = 3
+    bm25_retriever.k = 5  # re-ranking 후보 확보를 위해 확장
 
-    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
     ensemble_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, vector_retriever],
@@ -114,13 +138,8 @@ def query_regulation(query, vectorstore, llm, model_name="", shared_dir=""):
 
     docs = ensemble_retriever.invoke(query)
 
-    # ③ 제목 기반 재정렬
-    query_keywords = query.split()
-    docs = sorted(
-        docs,
-        key=lambda d: any(kw in d.metadata.get('Article_Title', '') for kw in query_keywords),
-        reverse=True
-    )
+    # ③ Cross-Encoder Re-ranking — 상위 4개로 압축
+    docs = _rerank(query, docs, top_k=4)
 
     # ④ 컨텍스트 구성
     context_text = "\n\n".join([

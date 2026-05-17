@@ -11,10 +11,10 @@ import json
 
 # LangChain & Core
 from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers import EnsembleRetriever
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain.schema import HumanMessage # [개선2] HumanMessage 추가
+from langchain_core.messages import HumanMessage # [개선2] HumanMessage 추가
 from langchain_core.prompts import PromptTemplate
 
 # Core 모듈
