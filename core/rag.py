@@ -1,17 +1,18 @@
 from langchain_community.retrievers import BM25Retriever
-from langchain_classic.retrievers import EnsembleRetriever
+from langchain.retrievers import EnsembleRetriever
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, SystemMessage
 from sentence_transformers import CrossEncoder
 import pandas as pd
 import re
 import os
+from typing import Optional
 
 # ------------------------------------------------------------------
 # Cross-Encoder 싱글톤 — 첫 호출 시 1회 로드 후 재사용
 # BAAI/bge-reranker-base: 한국어 포함 다국어 지원, ~280MB
 # ------------------------------------------------------------------
-_cross_encoder: CrossEncoder | None = None
+_cross_encoder: Optional[CrossEncoder] = None
 
 def _get_cross_encoder() -> CrossEncoder:
     global _cross_encoder

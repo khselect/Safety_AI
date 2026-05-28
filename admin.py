@@ -173,6 +173,7 @@ with st.sidebar:
     # [개선1] Ollama 모델 선택 기능
     st.subheader("🤖 LLM 모델 선택")
     ollama_models = [
+        "qwen3:32b",
         "qwen3:8b",
         "qwen2.5:7b-instruct",
         # "korean-llama3:latest",
@@ -182,12 +183,12 @@ with st.sidebar:
         "gemma4:latest"
     ]
     # 1. 현재 저장된 설정 불러오기 (초기값 설정)
-    current_index = 0 # 기본값 (qwen3:8b)
+    current_index = 0 # 기본값 (qwen3:32b)
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved_config = json.load(f)
-                saved_model = saved_config.get("selected_model", "qwen3:8b")
+                saved_model = saved_config.get("selected_model", "qwen3:32b")
                 if saved_model in ollama_models:
                     current_index = ollama_models.index(saved_model)
         except:

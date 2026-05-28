@@ -11,7 +11,7 @@ import json
 
 # LangChain & Core
 from langchain_community.retrievers import BM25Retriever
-from langchain_classic.retrievers import EnsembleRetriever
+from langchain.retrievers import EnsembleRetriever
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage # [개선2] HumanMessage 추가
@@ -64,7 +64,7 @@ def get_vectorstore():
 
 # [신규 함수] 설정된 모델명 가져오기
 def get_selected_model():
-    default_model = "korean-llama3:latest"
+    default_model = "qwen3:32b"
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
